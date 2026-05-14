@@ -14,9 +14,9 @@ results/
 checkpoints/
 logs/
 
-# external repos
-GroundingDINO_src/
-openvla-oft/
+# Large LIBERO datasets
+openvla-oft/LIBERO/libero/datasets/
+*.hdf5
 
 # weird temp files
 =*~
