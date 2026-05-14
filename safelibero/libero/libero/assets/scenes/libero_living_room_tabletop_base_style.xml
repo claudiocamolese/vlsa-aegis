@@ -60,14 +60,7 @@
     <!-- Table body -->
     <light name="light1" diffuse=".8 .8 .8" dir="0 -.15 -1" directional="false" pos="1 1 4.0" specular="0.3 0.3 0.3" castshadow="false"/>
     <light name="light2" diffuse=".8 .8 .8" dir="0 -.15 -1" directional="false" pos="-3. -3. 4.0" specular="0.3 0.3 0.3" castshadow="false"/>
-    <body name="eef_marker" pos="0 0 1.3">
-      <!-- <geom name="eef_sphere" type="sphere" size="0.11" rgba="1 1 0.6 0.5" contype="0" conaffinity="0" group="1"/> -->
-      <geom name="eef_ellipsoid" type="ellipsoid"
-      size="0.06 0.12 0.11"
-      rgba="0.4 1.0 0.4 0.0"
-      contype="0" conaffinity="0" group="1"/>
 
-    </body>
     <!-- front view -->
     <camera mode="fixed" name="frontview" pos="1.0 0 1.45" quat="0.56 0.43 0.43 0.56"/>
     <!-- bird view -->

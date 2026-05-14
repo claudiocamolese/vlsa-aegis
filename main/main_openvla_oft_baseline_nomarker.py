@@ -119,7 +119,7 @@ def eval_libero(args: Args) -> None:
     BOX_TRESHOLD = 0.35     # Source code bounding box threshold
     TEXT_TRESHOLD = 0.25    # Source code text threshold for key attributes
 
-    model_groundingdino = load_model(CONFIG_PATH, CHECKPOINT_PATH)
+    model_groundingdino = None  # OpenVLA-OFT baseline: no GroundingDINO
     # Start evaluation
     total_episodes, total_successes, total_safesuccesses = 0, 0, 0
     # for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
@@ -167,7 +167,10 @@ def eval_libero(args: Args) -> None:
             replay_images = []
             model = env.sim.model
             data = env.sim.data
-            eef_body_id = model.body_name2id("gripper0_eef")
+            # OpenVLA-OFT clean baseline: do NOT move gripper0_eef manually.
+            # In the AEGIS code this was used as a safety ellipsoid marker, but
+            # gripper0_eef is part of the robot model, not a harmless visual marker.
+            eef_body_id = None
 
             # Initial position and orientation of the end-effector ellipsoid
             eef_pos = obs["robot0_eef_pos"]
@@ -179,8 +182,9 @@ def eval_libero(args: Args) -> None:
             offset_world = R1 @ offset_local
             ball_pos = eef_pos + offset_world
             p1 = ball_pos
-            env.sim.model.body_pos[eef_body_id] = ball_pos
-            env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
+            # Disabled for OpenVLA-OFT baseline:
+            # env.sim.model.body_pos[eef_body_id] = ball_pos
+            # env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
             if "orange juice" in task_description or "milk" in task_description or "alphabet soup"  in task_description:
                 Q1_diag = np.array([0.06, 0.12, 0.2])
             else:
@@ -204,56 +208,13 @@ def eval_libero(args: Args) -> None:
 
 
             
-            # Detect obstacles
-            agentview_img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-            agentview_depth = np.ascontiguousarray(obs["agentview_depth"][::-1, ::-1])
- 
+            # OpenVLA-OFT baseline pura:
+            # - niente VLM obstacle detection
+            # - niente GroundingDINO
+            # - niente point cloud
+            # - niente AEGIS/CBF/QP
+            flag_safety_control = False
 
-            img_out_dir = out_dir/f"{episode_idx}"
-            img_out_dir.mkdir(parents=True, exist_ok=True)
-            # Get the obstacle most likely to be hit
-            obstacle_infromation = obstacle_detection(agentview_img, task_description, args.task_suite_name)
-            # obstacle_infromation = "white storage box"
-            agent_view_points = get_point_cloud(agentview_img, agentview_depth, env, "agentview", obstacle_infromation, model_groundingdino, img_out_dir)
-      
-            
-            backview_img = np.ascontiguousarray(obs["backview_image"][::-1, ::-1])
-            backview_depth = np.ascontiguousarray(obs["backview_depth"][::-1, ::-1])
-            back_view_points = get_point_cloud(backview_img, backview_depth, env, "backview", obstacle_infromation, model_groundingdino, img_out_dir)
-            
-            # df = pd.DataFrame(back_view_points, columns=["X", "Y", "Z"])
-            # df.to_csv("back_view_points.csv", index=False)
-            
-            if agent_view_points.shape[1] > 0 and back_view_points.shape[1] > 0:
-                full_points = np.vstack([agent_view_points, back_view_points])    # (Na + Nb, 3)
-            elif agent_view_points.shape[1] == 0 and back_view_points.shape[1] > 0:
-                full_points = back_view_points
-            elif agent_view_points.shape[1] > 0 and back_view_points.shape[1] == 0:
-                full_points = agent_view_points
-            else:
-                full_points = np.array([[]])
-
-            # df = pd.DataFrame(full_points, columns=["X", "Y", "Z"])
-            # df.to_csv("full_points.csv", index=False)
-
-            # Point cloud filtering
-            filter_points = filtering_points(full_points, args.task_suite_name)
-            # print("Number of points after filtering:", filter_points.shape[0])
-            flag_safety_control = True
-            if filter_points.shape[0] == 0:
-                flag_safety_control = False
-            # import pandas as pd
-            # df = pd.DataFrame(filter_points, columns=["X", "Y", "Z"])
-            # df.to_csv("filter_points.csv", index=False)
-
-            if flag_safety_control:
-                p2, R2, Q2_diag = fit_ellipse(filter_points, plot=True, save_path=img_out_dir)
-                # Control parameter settings
-                z_fixed = (p2 - p1)
-                z_fixed /= np.linalg.norm(z_fixed)
-                p_target = np.array([-0.05, 0.15, 1.05])
-                Kp_pos = 1
-                dt = 0.05
             t = 0
             # print("Joint names (qpos):", env.sim.model.joint_names)
 
@@ -382,6 +343,11 @@ def eval_libero(args: Args) -> None:
                     else:
                         t4 = time.time()
 
+                        if t < 40 or t % 25 == 0:
+                            print(f"[AEGIS action debug] t={t} action={action}")
+                            print(f"[AEGIS action debug] t={t} xyzrpy={action[:6]} gripper={action[6]}")
+                            print(f"[AEGIS state debug] t={t} eef_pos={obs['robot0_eef_pos']} gripper_qpos={obs['robot0_gripper_qpos']}")
+
                         obs, reward, done, info = env.step(action.tolist()) # Crucial step
 
 
@@ -406,8 +372,9 @@ def eval_libero(args: Args) -> None:
                     offset_local = np.array([0, 0, -0.08])
                     offset_world = R1 @ offset_local
                     ball_pos = eef_pos + offset_world
-                    env.sim.model.body_pos[eef_body_id] = ball_pos
-                    env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
+                    # Disabled for OpenVLA-OFT baseline:
+                    # env.sim.model.body_pos[eef_body_id] = ball_pos
+                    # env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
                     p1 = ball_pos
 
 

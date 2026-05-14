@@ -1,0 +1,22 @@
+# model weights
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# python cache
+__pycache__/
+*.pyc
+
+# outputs
+results/
+checkpoints/
+logs/
+
+# external repos
+GroundingDINO_src/
+openvla-oft/
+
+# weird temp files
+=*~

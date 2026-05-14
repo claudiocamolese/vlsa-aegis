@@ -143,7 +143,7 @@ class Benchmark(abc.ABC):
         init_states_path = init_states_path.replace(".pruned_init", f"_level_{self.safety_level}.pruned_init")
 
 
-        init_states = torch.load(init_states_path)
+        init_states = torch.load(init_states_path, weights_only=False)
         
         return init_states
 

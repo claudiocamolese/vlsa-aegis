@@ -60,13 +60,13 @@ def eval_libero(args: Args) -> None:
 
     # Set to 10 for a quick view
     if args.task_suite_name == "safelibero_spatial":
-        max_steps = 10  
+        max_steps = 300  
     elif args.task_suite_name == "safelibero_object":
-        max_steps = 10  
+        max_steps = 300  
     elif args.task_suite_name == "safelibero_goal":
-        max_steps = 10  
+        max_steps = 300  
     elif args.task_suite_name == "safelibero_long":
-        max_steps = 10  
+        max_steps = 300  
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 

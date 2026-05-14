@@ -444,56 +444,23 @@ def fit_ellipse(pts, plot=False, save_path="examples/libero/results/ellipse_plot
         plot_points_ellipse(pts, center, R, S, str(save_path/"ellipse_plot.png"))
     return center, R, S
 
+_LOCAL_VLM_OBSTACLE_DETECTOR = None
+
 def obstacle_detection(image, instruction, task_suite_name):
-    from zai import ZhipuAiClient
-    import base64
-    import matplotlib
-    matplotlib.use('Agg')  # ✅ Crucial: No GUI rendering
-    import matplotlib.pyplot as plt
-    import time
-    api_key = ""
+    global _LOCAL_VLM_OBSTACLE_DETECTOR
 
-    if api_key is None or api_key == "":
-        raise ValueError("Please enter api_key")
-    client = ZhipuAiClient(api_key=api_key)  # Fill in your own APIKey
-    plt.imsave("obstacle_detection.png", image)
+    from main.local_vlm_obstacle import LocalVLMObstacleDetector
 
-    image_path="obstacle_detection.png"
-    t0 = time.time()
-    with open(image_path, "rb") as image_file:
-        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-    print("large model is thinking...")
-    prefer_list = ['yellow rectangular book', 'blue moka pot',  'red mug', 'white storage box', 'black wine bottle', 'red milk carton']
-    if "long" in task_suite_name:
-        prefer_list.append('gray rectangular binder')
-    response = client.chat.completions.create(
-        model="glm-4.5v",  # Fill in the model name to call
-        messages=[
-            {
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": f"The robot must follow this instruction: {instruction}. Based on both the instruction and the image, identify exactly one non-robot object that is most likely to obstruct the robot's motion during task execution. You must output a uniquely identifiable obstacle name including both color and object type, preferably from this list when applicable: {prefer_list}. Output only the object name, with no additional words."
-                    }
-                ],
-                "role": "user",
+    if _LOCAL_VLM_OBSTACLE_DETECTOR is None:
+        _LOCAL_VLM_OBSTACLE_DETECTOR = LocalVLMObstacleDetector(
+            model_id="Qwen/Qwen2.5-VL-7B-Instruct",
+        )
 
-            }
-        ],
-        temperature=0.1, # Reduce randomness for more deterministic answers
-        top_p=0.1,
-        thinking={
-            "type":"enabled"
-        }
+    obstacle = _LOCAL_VLM_OBSTACLE_DETECTOR.detect(
+        image=image,
+        instruction=instruction,
+        task_suite_name=task_suite_name,
     )
-    clean_output = response.choices[0].message.content.replace("<|begin_of_box|>", "").replace("<|end_of_box|>", "")
-    print(clean_output)  # Output: gray cube
-    t1 = time.time()
-    print(f"large model thinking time: {t1-t0}s")
-    return clean_output
+
+    print(f"[LocalVLM obstacle_detection] {obstacle}")
+    return obstacle

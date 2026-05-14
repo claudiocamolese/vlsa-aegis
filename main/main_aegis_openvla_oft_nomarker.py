@@ -167,7 +167,9 @@ def eval_libero(args: Args) -> None:
             replay_images = []
             model = env.sim.model
             data = env.sim.data
-            eef_body_id = model.body_name2id("gripper0_eef")
+            # OpenVLA-OFT + AEGIS: do NOT move gripper0_eef manually.
+            # It is part of the robot model; moving it corrupts the robot/eef state.
+            eef_body_id = None
 
             # Initial position and orientation of the end-effector ellipsoid
             eef_pos = obs["robot0_eef_pos"]
@@ -179,8 +181,9 @@ def eval_libero(args: Args) -> None:
             offset_world = R1 @ offset_local
             ball_pos = eef_pos + offset_world
             p1 = ball_pos
-            env.sim.model.body_pos[eef_body_id] = ball_pos
-            env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
+            # Disabled: do not move gripper0_eef manually.
+            # env.sim.model.body_pos[eef_body_id] = ball_pos
+            # env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
             if "orange juice" in task_description or "milk" in task_description or "alphabet soup"  in task_description:
                 Q1_diag = np.array([0.06, 0.12, 0.2])
             else:
@@ -406,8 +409,9 @@ def eval_libero(args: Args) -> None:
                     offset_local = np.array([0, 0, -0.08])
                     offset_world = R1 @ offset_local
                     ball_pos = eef_pos + offset_world
-                    env.sim.model.body_pos[eef_body_id] = ball_pos
-                    env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
+                    # Disabled: do not move gripper0_eef manually.
+                    # env.sim.model.body_pos[eef_body_id] = ball_pos
+                    # env.sim.model.body_quat[eef_body_id] = eef_quat[[3, 0, 1, 2]]
                     p1 = ball_pos
 
 
