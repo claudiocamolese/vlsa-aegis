@@ -1,0 +1,5 @@
+benchmark_root: /home/olaf/Claudio/vlsa-aegis/safelibero/libero/libero
+bddl_files: /home/olaf/Claudio/vlsa-aegis/safelibero/libero/libero/bddl_files
+init_states: /home/olaf/Claudio/vlsa-aegis/safelibero/libero/libero/init_files
+datasets: /home/olaf/Claudio/vlsa-aegis/safelibero/libero/datasets
+assets: /home/olaf/Claudio/vlsa-aegis/safelibero/libero/libero/assets
