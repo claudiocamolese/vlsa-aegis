@@ -42,11 +42,36 @@ DEFAULT_EXCLUDE_PATTERNS = (
 )
 
 
+DEFAULT_ROBOT_COLLISION_PATTERNS = (
+    "panda",
+    "gripper",
+    "finger",
+    "hand",
+    "eef",
+    "robot0_link",
+)
+
+
 @dataclass(frozen=True)
 class CameraCloud:
     local: np.ndarray
     world: np.ndarray
     instance_ids: np.ndarray
+
+
+@dataclass(frozen=True)
+class IKFrame:
+    kind: str
+    name: str
+
+
+@dataclass(frozen=True)
+class IKResult:
+    success: bool
+    q: np.ndarray
+    pos_error: float
+    ori_error: float
+    iterations: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +102,92 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translation-action-scale", type=float, default=0.025)
     parser.add_argument("--rotation-action-scale", type=float, default=0.08)
     parser.add_argument("--gripper-action", type=float, default=-1.0)
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["random_pose", "random_action"],
+        default="random_pose",
+        help="random_pose samples absolute EE poses and solves IK; random_action keeps the old action rollout.",
+    )
+    parser.add_argument(
+        "--pose-workspace-min",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Min xyz for random EE pose sampling. Defaults to --workspace-min.",
+    )
+    parser.add_argument(
+        "--pose-workspace-max",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Max xyz for random EE pose sampling. Defaults to --workspace-max.",
+    )
+    parser.add_argument(
+        "--pose-xy-source",
+        choices=["table", "box"],
+        default="table",
+        help="Use the tabletop XY bounds for random EE poses, or the explicit pose/workspace box.",
+    )
+    parser.add_argument(
+        "--pose-table-margin",
+        type=float,
+        default=0.05,
+        help="Inset applied to tabletop XY bounds when --pose-xy-source=table.",
+    )
+    parser.add_argument(
+        "--ee-orientation-delta-range-deg",
+        type=float,
+        nargs=3,
+        default=[25.0, 25.0, 180.0],
+        metavar=("ROLL", "PITCH", "YAW"),
+        help="Uniform +/- Euler perturbation around the reference EE orientation, in degrees.",
+    )
+    parser.add_argument(
+        "--ee-orientation-reference-quat-xyzw",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("X", "Y", "Z", "W"),
+        help="Optional fixed reference quaternion for EE orientation sampling. Defaults to each init-state EE orientation.",
+    )
+    parser.add_argument("--ik-frame-name", default=None, help="Optional body/site name used as IK EE frame.")
+    parser.add_argument(
+        "--ik-frame-type",
+        choices=["auto", "body", "site"],
+        default="auto",
+        help="Frame type for --ik-frame-name, or auto-detect when omitted.",
+    )
+    parser.add_argument("--ik-max-iters", type=int, default=120)
+    parser.add_argument("--ik-damping", type=float, default=0.05)
+    parser.add_argument("--ik-position-tol", type=float, default=0.01)
+    parser.add_argument("--ik-orientation-tol", type=float, default=0.08)
+    parser.add_argument("--ik-max-dq", type=float, default=0.12)
+    parser.add_argument("--ik-orientation-weight", type=float, default=0.35)
+    parser.add_argument(
+        "--max-pose-attempts-per-sample",
+        type=int,
+        default=50,
+        help="Retry budget per desired saved sample when IK/collision/pointcloud filters reject a random pose.",
+    )
+    parser.add_argument(
+        "--collision-margin",
+        type=float,
+        default=0.0,
+        help="Reject robot contacts whose MuJoCo contact distance is <= this margin.",
+    )
+    parser.add_argument(
+        "--robot-collision-name-patterns",
+        nargs="*",
+        default=list(DEFAULT_ROBOT_COLLISION_PATTERNS),
+        help="Geom/body-name substrings used to decide whether a contact involves the robot.",
+    )
+    parser.add_argument(
+        "--reject-robot-self-collisions",
+        action="store_true",
+        help="Also reject robot-vs-robot contacts. Off by default to avoid gripper/link false positives.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--workspace-min",
@@ -127,6 +238,20 @@ def parse_args() -> argparse.Namespace:
         "--debug-vis-dir",
         default=None,
         help="Optional directory where RGB debug frames are saved during collection.",
+    )
+    parser.add_argument(
+        "--pose-debug-dir",
+        default=None,
+        help=(
+            "Optional structured pose-sampling debug root. Saves ee/rgb, ee/pointcloud, "
+            "backview/rgb, backview/pointcloud, and fused_pointcloud outputs."
+        ),
+    )
+    parser.add_argument(
+        "--pose-debug-max",
+        type=int,
+        default=20,
+        help="Maximum number of accepted pose samples to save in --pose-debug-dir.",
     )
     parser.add_argument(
         "--debug-vis-every",
@@ -499,6 +624,22 @@ def segmentation_from_obs(obs: Mapping[str, Any], camera_name: str, flip_images:
     return seg
 
 
+def semantic_rgb_from_obs(
+    obs: Mapping[str, Any],
+    camera_name: str,
+    keep_ids: np.ndarray,
+    flip_images: bool,
+) -> np.ndarray:
+    rgb = camera_rgb_from_obs(obs, camera_name, flip_images)
+    seg = segmentation_from_obs(obs, camera_name, flip_images)
+    mask = np.isin(seg, keep_ids)
+    overlay = rgb.copy()
+    if np.any(mask):
+        color = np.asarray([255, 80, 0], dtype=np.float32)
+        overlay[mask] = np.clip(0.55 * overlay[mask].astype(np.float32) + 0.45 * color, 0, 255)
+    return overlay.astype(np.uint8)
+
+
 def save_debug_frame(
     obs: Mapping[str, Any],
     camera_names: Sequence[str],
@@ -598,6 +739,127 @@ def write_ascii_ply(path: Path, points: np.ndarray, color: Tuple[int, int, int])
             f.write(f"{point[0]:.7f} {point[1]:.7f} {point[2]:.7f} {r} {g} {b}\n")
 
 
+def save_fused_pointcloud_debug_png(
+    ee_cloud: CameraCloud,
+    backview_cloud: CameraCloud,
+    ee_pos_world: np.ndarray,
+    output_path: Path,
+    metadata: Mapping[str, Any],
+    max_points: int,
+    rng: np.random.Generator,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ee_points = downsample_points_for_debug(ee_cloud.world, max_points, rng)
+    backview_points = downsample_points_for_debug(backview_cloud.world, max_points, rng)
+    point_sets = [points for points in (ee_points, backview_points) if points.shape[0] > 0]
+    all_points = np.concatenate(point_sets, axis=0) if point_sets else np.zeros((0, 3), dtype=np.float32)
+
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    if ee_points.shape[0] > 0:
+        ax.scatter(
+            ee_points[:, 0],
+            ee_points[:, 1],
+            ee_points[:, 2],
+            s=1.5,
+            c="#1f77b4",
+            alpha=0.7,
+            label="ee",
+        )
+    if backview_points.shape[0] > 0:
+        ax.scatter(
+            backview_points[:, 0],
+            backview_points[:, 1],
+            backview_points[:, 2],
+            s=1.5,
+            c="#ff7f0e",
+            alpha=0.7,
+            label="backview",
+        )
+
+    ee = np.asarray(ee_pos_world, dtype=np.float32).reshape(3)
+    ax.scatter([ee[0]], [ee[1]], [ee[2]], s=45, c="#d62728", marker="o", label="EE")
+    set_axes_equal_3d(ax, all_points, ee)
+    ax.view_init(elev=24, azim=-55)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.set_title("fused pointcloud: ee blue, backview orange")
+    ax.legend(loc="upper right")
+    fig.suptitle(
+        f"sample={metadata['sample_index']} task={metadata['task_id']} "
+        f"init={metadata['init_state_id']} step={metadata['rollout_step']}"
+    )
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def save_pose_sampling_debug_sample(
+    obs: Mapping[str, Any],
+    ee_cloud: CameraCloud,
+    backview_cloud: CameraCloud,
+    output_dir: Path,
+    sample_idx: int,
+    metadata: Mapping[str, Any],
+    keep_ids: np.ndarray,
+    camera_ee: str,
+    camera_backview: str,
+    flip_images: bool,
+    max_points: int,
+    rng: np.random.Generator,
+) -> None:
+    import imageio.v2 as imageio
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"sample_{sample_idx:06d}"
+
+    ee_rgb_path = output_dir / "ee" / "rgb" / f"{stem}.png"
+    ee_ply_path = output_dir / "ee" / "pointcloud" / f"{stem}.ply"
+    back_rgb_path = output_dir / "backview" / "rgb" / f"{stem}.png"
+    back_ply_path = output_dir / "backview" / "pointcloud" / f"{stem}.ply"
+    fused_path = output_dir / "fused_pointcloud" / f"{stem}.png"
+
+    ee_rgb_path.parent.mkdir(parents=True, exist_ok=True)
+    back_rgb_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(ee_rgb_path, semantic_rgb_from_obs(obs, camera_ee, keep_ids, flip_images))
+    imageio.imwrite(
+        back_rgb_path,
+        semantic_rgb_from_obs(obs, camera_backview, keep_ids, flip_images),
+    )
+    write_ascii_ply(ee_ply_path, ee_cloud.world, (31, 119, 180))
+    write_ascii_ply(back_ply_path, backview_cloud.world, (255, 127, 14))
+    save_fused_pointcloud_debug_png(
+        ee_cloud=ee_cloud,
+        backview_cloud=backview_cloud,
+        ee_pos_world=np.asarray(metadata["ee_pos_world"], dtype=np.float32),
+        output_path=fused_path,
+        metadata=metadata,
+        max_points=max_points,
+        rng=rng,
+    )
+
+    record = dict(metadata)
+    record.update(
+        {
+            "ee_rgb": str(ee_rgb_path.relative_to(output_dir)),
+            "ee_pointcloud": str(ee_ply_path.relative_to(output_dir)),
+            "backview_rgb": str(back_rgb_path.relative_to(output_dir)),
+            "backview_pointcloud": str(back_ply_path.relative_to(output_dir)),
+            "fused_pointcloud": str(fused_path.relative_to(output_dir)),
+            "rgb_semantic_overlay": True,
+            "semantic_keep_ids": [int(x) for x in keep_ids.tolist()],
+        }
+    )
+    with open(output_dir / "metadata.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def save_debug_pointcloud_frame(
     wrist_cloud: CameraCloud,
     ext_cloud: CameraCloud,
@@ -609,6 +871,7 @@ def save_debug_pointcloud_frame(
     max_points: int,
     rng: np.random.Generator,
     save_ply: bool,
+    ee_quat_world: Optional[np.ndarray] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -644,6 +907,21 @@ def save_debug_pointcloud_frame(
             ax.scatter([ee[0]], [ee[1]], [ee[2]], s=45, c="#d62728", marker="o", label="EE")
             rep = np.asarray(v_rep_world, dtype=np.float32).reshape(3)
             ax.quiver(ee[0], ee[1], ee[2], rep[0], rep[1], rep[2], length=0.12, color="#2ca02c")
+            if ee_quat_world is not None:
+                rot = quat_xyzw_to_matrix(np.asarray(ee_quat_world, dtype=np.float32))
+                for axis_idx, axis_color in enumerate(("#d62728", "#2ca02c", "#1f77b4")):
+                    direction = rot[:, axis_idx]
+                    ax.quiver(
+                        ee[0],
+                        ee[1],
+                        ee[2],
+                        direction[0],
+                        direction[1],
+                        direction[2],
+                        length=0.08,
+                        color=axis_color,
+                        alpha=0.9,
+                    )
         ax.set_title(title)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
@@ -762,19 +1040,491 @@ def random_action(args: argparse.Namespace, rng: np.random.Generator) -> np.ndar
     return action
 
 
-def compute_jacobian(env: Any) -> np.ndarray:
-    nan_jac = np.full((3, 7), np.nan, dtype=np.float32)
+def normalize_quat(quat: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(quat))
+    if norm < 1e-12:
+        raise ValueError("Quaternion norm is zero")
+    return quat / norm
+
+
+def quat_xyzw_to_wxyz(quat: np.ndarray) -> np.ndarray:
+    quat = normalize_quat(quat)
+    return np.asarray([quat[3], quat[0], quat[1], quat[2]], dtype=np.float64)
+
+
+def quat_wxyz_to_xyzw(quat: np.ndarray) -> np.ndarray:
+    quat = normalize_quat(quat)
+    return np.asarray([quat[1], quat[2], quat[3], quat[0]], dtype=np.float64)
+
+
+def quat_conjugate_wxyz(quat: np.ndarray) -> np.ndarray:
+    quat = normalize_quat(quat)
+    return np.asarray([quat[0], -quat[1], -quat[2], -quat[3]], dtype=np.float64)
+
+
+def quat_multiply_wxyz(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = normalize_quat(lhs)
+    w2, x2, y2, z2 = normalize_quat(rhs)
+    return normalize_quat(
+        np.asarray(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ],
+            dtype=np.float64,
+        )
+    )
+
+
+def quat_multiply_xyzw(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    return quat_wxyz_to_xyzw(
+        quat_multiply_wxyz(quat_xyzw_to_wxyz(lhs), quat_xyzw_to_wxyz(rhs))
+    )
+
+
+def euler_xyz_to_quat_xyzw(euler_xyz: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = np.asarray(euler_xyz, dtype=np.float64).reshape(3)
+    cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+    cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+    cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return quat_wxyz_to_xyzw(np.asarray([w, x, y, z], dtype=np.float64))
+
+
+def quat_wxyz_to_matrix(quat: np.ndarray) -> np.ndarray:
+    w, x, y, z = normalize_quat(quat)
+    return np.asarray(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
+    return quat_wxyz_to_matrix(quat_xyzw_to_wxyz(quat))
+
+
+def matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
+    m = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    return normalize_quat(np.asarray([w, x, y, z], dtype=np.float64))
+
+
+def orientation_error_wxyz(target_quat: np.ndarray, current_quat: np.ndarray) -> np.ndarray:
+    q_err = quat_multiply_wxyz(target_quat, quat_conjugate_wxyz(current_quat))
+    if q_err[0] < 0.0:
+        q_err = -q_err
+    return (2.0 * q_err[1:]).astype(np.float64)
+
+
+def quaternion_angle_error_wxyz(target_quat: np.ndarray, current_quat: np.ndarray) -> float:
+    target = normalize_quat(target_quat)
+    current = normalize_quat(current_quat)
+    dot = float(np.clip(abs(np.dot(target, current)), -1.0, 1.0))
+    return float(2.0 * np.arccos(dot))
+
+
+def sample_random_ee_pose(
+    rng: np.random.Generator,
+    pose_workspace_min: np.ndarray,
+    pose_workspace_max: np.ndarray,
+    reference_quat_xyzw: np.ndarray,
+    orientation_delta_range_deg: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_pos = rng.uniform(pose_workspace_min, pose_workspace_max).astype(np.float64)
+    delta_range = np.deg2rad(np.asarray(orientation_delta_range_deg, dtype=np.float64).reshape(3))
+    delta_euler = rng.uniform(-delta_range, delta_range)
+    delta_quat = euler_xyz_to_quat_xyzw(delta_euler)
+    target_quat = quat_multiply_xyzw(reference_quat_xyzw, delta_quat)
+    return target_pos.astype(np.float32), target_quat.astype(np.float32), delta_euler.astype(np.float32)
+
+
+def unwrap_env(env: Any) -> Any:
+    return env.env if hasattr(env, "env") else env
+
+
+def table_full_size_for_env(env: Any) -> Optional[np.ndarray]:
+    task_env = unwrap_env(env)
+    arena_type = str(getattr(task_env, "_arena_type", ""))
+    candidates = {
+        "table": "table_full_size",
+        "kitchen": "kitchen_table_full_size",
+        "study": "study_table_full_size",
+        "coffee_table": "coffee_table_full_size",
+        "living_room": "living_room_table_full_size",
+    }
+    names = [candidates[arena_type]] if arena_type in candidates else []
+    names += [
+        "table_full_size",
+        "kitchen_table_full_size",
+        "study_table_full_size",
+        "coffee_table_full_size",
+        "living_room_table_full_size",
+    ]
+    for name in names:
+        if hasattr(task_env, name):
+            full_size = np.asarray(getattr(task_env, name), dtype=np.float32).reshape(-1)
+            if full_size.shape[0] >= 2 and np.all(full_size[:2] > 0.0):
+                return full_size[:3] if full_size.shape[0] >= 3 else full_size[:2]
+    return None
+
+
+def table_xy_bounds_from_attrs(env: Any, margin: float) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    task_env = unwrap_env(env)
+    full_size = table_full_size_for_env(task_env)
+    if full_size is None:
+        return None
+    center = np.asarray(getattr(task_env, "workspace_offset", [0.0, 0.0, 0.0]), dtype=np.float32)
+    half_xy = 0.5 * full_size[:2].astype(np.float32)
+    inset = np.minimum(np.maximum(float(margin), 0.0), np.maximum(half_xy - 1e-4, 0.0))
+    xy_min = center[:2] - half_xy + inset
+    xy_max = center[:2] + half_xy - inset
+    if np.any(xy_max <= xy_min):
+        return None
+    return xy_min.astype(np.float32), xy_max.astype(np.float32)
+
+
+def table_xy_bounds_from_sim(env: Any, margin: float) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    sim = env.sim
+    model = sim.model
+    data = sim.data
+    for geom_name in ("table_collision", "table_visual"):
+        try:
+            geom_id = int(model.geom_name2id(geom_name))
+        except Exception:
+            continue
+        try:
+            center = np.asarray(data.geom_xpos[geom_id], dtype=np.float32)
+            half_xy = np.asarray(model.geom_size[geom_id][:2], dtype=np.float32)
+        except Exception:
+            continue
+        if half_xy.shape[0] != 2 or np.any(half_xy <= 0.0):
+            continue
+        inset = np.minimum(np.maximum(float(margin), 0.0), np.maximum(half_xy - 1e-4, 0.0))
+        xy_min = center[:2] - half_xy + inset
+        xy_max = center[:2] + half_xy - inset
+        if np.all(xy_max > xy_min):
+            return xy_min.astype(np.float32), xy_max.astype(np.float32)
+    return None
+
+
+def pose_workspace_for_env(
+    env: Any,
+    args: argparse.Namespace,
+    default_pose_min: np.ndarray,
+    default_pose_max: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    pose_min = np.asarray(default_pose_min, dtype=np.float32).copy()
+    pose_max = np.asarray(default_pose_max, dtype=np.float32).copy()
+    if args.pose_xy_source == "box":
+        return pose_min, pose_max
+
+    bounds = table_xy_bounds_from_attrs(env, margin=float(args.pose_table_margin))
+    if bounds is None:
+        bounds = table_xy_bounds_from_sim(env, margin=float(args.pose_table_margin))
+    if bounds is None:
+        print("[dataset] warning: could not infer tabletop XY bounds; using pose workspace box")
+        return pose_min, pose_max
+
+    pose_min[:2], pose_max[:2] = bounds
+    return pose_min, pose_max
+
+
+def model_body_exists(model: Any, name: str) -> bool:
     try:
-        body_name = "eef_marker"
-        jac_full = env.sim.data.get_body_jacp(body_name).reshape(3, -1)
-        robot = env.robots[0]
-        vel_indices = getattr(robot, "_ref_joint_vel_indexes", None)
-        if vel_indices is None:
-            vel_indices = getattr(robot, "_ref_joint_vel_indexes", None)
-        if vel_indices is None:
-            vel_indices = list(range(7))
-        jac = jac_full[:, list(vel_indices)[:7]]
-        if jac.shape != (3, 7):
+        model.body_name2id(name)
+        return True
+    except Exception:
+        return False
+
+
+def model_site_exists(model: Any, name: str) -> bool:
+    try:
+        model.site_name2id(name)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_ik_frame(env: Any, args: argparse.Namespace) -> IKFrame:
+    model = env.sim.model
+    if args.ik_frame_name:
+        if args.ik_frame_type in ("auto", "body") and model_body_exists(model, args.ik_frame_name):
+            return IKFrame(kind="body", name=str(args.ik_frame_name))
+        if args.ik_frame_type in ("auto", "site") and model_site_exists(model, args.ik_frame_name):
+            return IKFrame(kind="site", name=str(args.ik_frame_name))
+        raise ValueError(
+            f"Could not find IK frame {args.ik_frame_name!r} as {args.ik_frame_type}."
+        )
+
+    for name in ("gripper0_eef", "eef_marker", "robot0_eef", "right_hand"):
+        if model_body_exists(model, name):
+            return IKFrame(kind="body", name=name)
+    for name in ("gripper0_grip_site", "gripper0_ft_frame", "robot0_eef_site", "eef_site"):
+        if model_site_exists(model, name):
+            return IKFrame(kind="site", name=name)
+
+    raise ValueError(
+        "Could not auto-detect an IK EE frame. Pass --ik-frame-name and --ik-frame-type."
+    )
+
+
+def frame_pose_wxyz(env: Any, frame: IKFrame) -> Tuple[np.ndarray, np.ndarray]:
+    sim = env.sim
+    if frame.kind == "body":
+        body_id = sim.model.body_name2id(frame.name)
+        try:
+            pos = np.asarray(sim.data.get_body_xpos(frame.name), dtype=np.float64)
+        except Exception:
+            pos = np.asarray(sim.data.body_xpos[body_id], dtype=np.float64)
+        try:
+            quat = np.asarray(sim.data.get_body_xquat(frame.name), dtype=np.float64)
+        except Exception:
+            quat = np.asarray(sim.data.body_xquat[body_id], dtype=np.float64)
+        return pos.reshape(3), normalize_quat(quat)
+
+    site_id = sim.model.site_name2id(frame.name)
+    try:
+        pos = np.asarray(sim.data.get_site_xpos(frame.name), dtype=np.float64)
+    except Exception:
+        pos = np.asarray(sim.data.site_xpos[site_id], dtype=np.float64)
+    try:
+        xmat = np.asarray(sim.data.get_site_xmat(frame.name), dtype=np.float64).reshape(3, 3)
+    except Exception:
+        xmat = np.asarray(sim.data.site_xmat[site_id], dtype=np.float64).reshape(3, 3)
+    return pos.reshape(3), matrix_to_quat_wxyz(xmat)
+
+
+def frame_jacobian(env: Any, frame: IKFrame, qvel_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if frame.kind == "body":
+        jacp = env.sim.data.get_body_jacp(frame.name).reshape(3, -1)
+        jacr = env.sim.data.get_body_jacr(frame.name).reshape(3, -1)
+    else:
+        jacp = env.sim.data.get_site_jacp(frame.name).reshape(3, -1)
+        jacr = env.sim.data.get_site_jacr(frame.name).reshape(3, -1)
+    return jacp[:, qvel_indices].astype(np.float64), jacr[:, qvel_indices].astype(np.float64)
+
+
+def robot_joint_indices(env: Any) -> Tuple[np.ndarray, np.ndarray]:
+    robot = env.robots[0]
+    qpos_indices = getattr(robot, "_ref_joint_pos_indexes", None)
+    qvel_indices = getattr(robot, "_ref_joint_vel_indexes", None)
+    if qpos_indices is None or qvel_indices is None:
+        raise AttributeError("Could not find robosuite robot joint qpos/qvel indexes.")
+
+    qpos = np.asarray(qpos_indices, dtype=np.int64).reshape(-1)[:7]
+    qvel = np.asarray(qvel_indices, dtype=np.int64).reshape(-1)[:7]
+    if qpos.shape[0] != 7 or qvel.shape[0] != 7:
+        raise ValueError(f"Expected 7 Panda arm indexes, got qpos={qpos}, qvel={qvel}")
+    return qpos, qvel
+
+
+def robot_joint_limits(env: Any, qpos_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    lower = np.asarray(
+        [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+        dtype=np.float64,
+    )
+    upper = np.asarray(
+        [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+        dtype=np.float64,
+    )
+
+    robot = env.robots[0]
+    joint_names = getattr(robot, "robot_joints", None)
+    if joint_names is None or len(joint_names) == 0:
+        joint_names = getattr(robot, "joint_names", None)
+    if joint_names is not None and len(joint_names) > 0:
+        resolved_lower = lower.copy()
+        resolved_upper = upper.copy()
+        for idx, joint_name in enumerate(list(joint_names)[: len(qpos_indices)]):
+            try:
+                joint_id = env.sim.model.joint_name2id(joint_name)
+                limited = np.asarray(env.sim.model.jnt_limited).reshape(-1)
+                if int(limited[joint_id]) == 1:
+                    resolved_lower[idx], resolved_upper[idx] = env.sim.model.jnt_range[joint_id]
+            except Exception:
+                continue
+        return resolved_lower, resolved_upper
+
+    return lower, upper
+
+
+def set_robot_qpos(
+    env: Any,
+    q: np.ndarray,
+    qpos_indices: np.ndarray,
+    qvel_indices: np.ndarray,
+) -> None:
+    env.sim.data.qpos[qpos_indices] = np.asarray(q, dtype=np.float64).reshape(7)
+    env.sim.data.qvel[qvel_indices] = 0.0
+    env.sim.forward()
+
+
+def solve_ik_to_pose(
+    env: Any,
+    target_pos: np.ndarray,
+    target_quat_xyzw: np.ndarray,
+    frame: IKFrame,
+    qpos_indices: np.ndarray,
+    qvel_indices: np.ndarray,
+    joint_lower: np.ndarray,
+    joint_upper: np.ndarray,
+    args: argparse.Namespace,
+) -> IKResult:
+    target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+    target_quat_wxyz = quat_xyzw_to_wxyz(target_quat_xyzw)
+    q = np.asarray(env.sim.data.qpos[qpos_indices], dtype=np.float64).reshape(7).copy()
+
+    max_iters = max(1, int(args.ik_max_iters))
+    damping = max(1e-8, float(args.ik_damping))
+    max_dq = max(1e-8, float(args.ik_max_dq))
+    ori_weight = max(0.0, float(args.ik_orientation_weight))
+
+    pos_error_norm = np.inf
+    ori_error_norm = np.inf
+    iteration = 0
+    for iteration in range(1, max_iters + 1):
+        set_robot_qpos(env, q, qpos_indices, qvel_indices)
+        current_pos, current_quat_wxyz = frame_pose_wxyz(env, frame)
+
+        pos_error = target_pos - current_pos
+        ori_error = orientation_error_wxyz(target_quat_wxyz, current_quat_wxyz)
+        pos_error_norm = float(np.linalg.norm(pos_error))
+        ori_error_norm = quaternion_angle_error_wxyz(target_quat_wxyz, current_quat_wxyz)
+        if (
+            pos_error_norm <= float(args.ik_position_tol)
+            and ori_error_norm <= float(args.ik_orientation_tol)
+        ):
+            return IKResult(True, q.astype(np.float32), pos_error_norm, ori_error_norm, iteration)
+
+        jacp, jacr = frame_jacobian(env, frame, qvel_indices)
+        jac = np.vstack([jacp, ori_weight * jacr])
+        error = np.concatenate([pos_error, ori_weight * ori_error], axis=0)
+        lhs = jac @ jac.T + (damping**2) * np.eye(6, dtype=np.float64)
+        try:
+            dq = jac.T @ np.linalg.solve(lhs, error)
+        except np.linalg.LinAlgError:
+            dq = jac.T @ np.linalg.lstsq(lhs, error, rcond=None)[0]
+
+        dq_norm_inf = float(np.max(np.abs(dq)))
+        if dq_norm_inf > max_dq:
+            dq *= max_dq / dq_norm_inf
+        q = np.clip(q + dq, joint_lower, joint_upper)
+
+    set_robot_qpos(env, q, qpos_indices, qvel_indices)
+    current_pos, current_quat_wxyz = frame_pose_wxyz(env, frame)
+    pos_error_norm = float(np.linalg.norm(target_pos - current_pos))
+    ori_error_norm = quaternion_angle_error_wxyz(target_quat_wxyz, current_quat_wxyz)
+    success = (
+        pos_error_norm <= float(args.ik_position_tol)
+        and ori_error_norm <= float(args.ik_orientation_tol)
+    )
+    return IKResult(success, q.astype(np.float32), pos_error_norm, ori_error_norm, iteration)
+
+
+def model_geom_name(model: Any, geom_id: int) -> str:
+    try:
+        name = model.geom_id2name(int(geom_id))
+    except Exception:
+        name = None
+    return str(name or "")
+
+
+def model_body_name_from_geom(model: Any, geom_id: int) -> str:
+    try:
+        body_id = int(model.geom_bodyid[int(geom_id)])
+        name = model.body_id2name(body_id)
+    except Exception:
+        name = None
+    return str(name or "")
+
+
+def geom_or_body_matches(model: Any, geom_id: int, patterns: Sequence[str]) -> bool:
+    text = f"{model_geom_name(model, geom_id)} {model_body_name_from_geom(model, geom_id)}"
+    return name_matches(text, patterns)
+
+
+def robot_collision_contacts(
+    env: Any,
+    robot_patterns: Sequence[str],
+    margin: float,
+    reject_robot_self_collisions: bool,
+) -> List[Dict[str, Any]]:
+    model = env.sim.model
+    data = env.sim.data
+    collisions: List[Dict[str, Any]] = []
+    for contact_idx in range(int(getattr(data, "ncon", 0))):
+        contact = data.contact[contact_idx]
+        if float(contact.dist) > float(margin):
+            continue
+        geom1 = int(contact.geom1)
+        geom2 = int(contact.geom2)
+        geom1_is_robot = geom_or_body_matches(model, geom1, robot_patterns)
+        geom2_is_robot = geom_or_body_matches(model, geom2, robot_patterns)
+        if not (geom1_is_robot or geom2_is_robot):
+            continue
+        if geom1_is_robot and geom2_is_robot and not reject_robot_self_collisions:
+            continue
+        collisions.append(
+            {
+                "geom1": model_geom_name(model, geom1),
+                "body1": model_body_name_from_geom(model, geom1),
+                "geom2": model_geom_name(model, geom2),
+                "body2": model_body_name_from_geom(model, geom2),
+                "dist": float(contact.dist),
+            }
+        )
+    return collisions
+
+
+def compute_jacobian(
+    env: Any,
+    frame: Optional[IKFrame],
+    qvel_indices: Optional[np.ndarray],
+) -> np.ndarray:
+    nan_jac = np.full((6, 7), np.nan, dtype=np.float32)
+    try:
+        if frame is None:
+            return nan_jac
+        if qvel_indices is None:
+            _, qvel_indices = robot_joint_indices(env)
+        jacp, jacr = frame_jacobian(env, frame, qvel_indices)
+        jac = np.vstack([jacp, jacr])
+        if jac.shape != (6, 7):
             return nan_jac
         return jac.astype(np.float32)
     except Exception:
@@ -787,51 +1537,71 @@ class H5Writer:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         self.hf = h5py.File(path, "w")
-        self.group = self.hf.create_group("samples")
+        self.tasks_group = self.hf.create_group("tasks")
         self.n = 0
+        self.n_points = int(n_points)
         self.save_jacobian = save_jacobian
+        self.scene_counts: Dict[Tuple[int, int], int] = {}
 
-        self._create("q", (7,), np.float32)
-        self._create("ee_pos_world", (3,), np.float32)
-        self._create("ee_ori_world", (4,), np.float32)
-        self._create("pointcloud_wrist_local", (n_points, 3), np.float32)
-        self._create("pointcloud_wrist_world", (n_points, 3), np.float32)
-        self._create("pointcloud_ext_local", (n_points, 3), np.float32)
-        self._create("pointcloud_ext_world", (n_points, 3), np.float32)
-        self._create("point_object_id_wrist", (n_points,), np.int32)
-        self._create("point_object_id_ext", (n_points,), np.int32)
-        self._create("S_star_obs", (1,), np.float32)
-        self._create("d_obs_hard", (1,), np.float32)
-        self._create("v_rep", (3,), np.float32)
-        self._create("task_id", (1,), np.int32)
-        self._create("init_state_id", (1,), np.int32)
-        self._create("rollout_step", (1,), np.int32)
-        if save_jacobian:
-            self._create("J_ee", (3, 7), np.float32)
+    def register_task(self, task_id: int, task_name: str) -> None:
+        task_group = self.tasks_group.require_group(f"task_{int(task_id):03d}")
+        task_group.attrs["task_id"] = int(task_id)
+        task_group.attrs["task_name"] = str(task_name)
+        task_group.require_group("scenes")
 
-    def _create(self, name: str, tail_shape: Tuple[int, ...], dtype: Any) -> None:
+    def _scene_group(self, task_id: int, init_state_id: int) -> Any:
+        task_group = self.tasks_group.require_group(f"task_{int(task_id):03d}")
+        task_group.attrs["task_id"] = int(task_id)
+        scenes_group = task_group.require_group("scenes")
+        scene_group = scenes_group.require_group(f"init_{int(init_state_id):03d}")
+        scene_group.attrs["task_id"] = int(task_id)
+        scene_group.attrs["init_state_id"] = int(init_state_id)
+        return scene_group
+
+    def _dataset_parent(self, scene_group: Any, name: str) -> Tuple[Any, str]:
+        if "/" not in name:
+            return scene_group, name
+        parent_path, dataset_name = name.rsplit("/", 1)
+        parent = scene_group
+        for part in parent_path.split("/"):
+            parent = parent.require_group(part)
+        return parent, dataset_name
+
+    def _require_dataset(self, scene_group: Any, name: str, value: np.ndarray) -> Any:
+        parent, dataset_name = self._dataset_parent(scene_group, name)
+        if dataset_name in parent:
+            return parent[dataset_name]
+
+        value = np.asarray(value)
+        tail_shape = tuple(value.shape)
         chunks = (1,) + tail_shape
-        self.group.create_dataset(
-            name,
+        return parent.create_dataset(
+            dataset_name,
             shape=(0,) + tail_shape,
             maxshape=(None,) + tail_shape,
             chunks=chunks,
-            dtype=dtype,
+            dtype=value.dtype,
             compression="gzip",
             compression_opts=4,
             shuffle=True,
         )
 
-    def append(self, sample: Mapping[str, np.ndarray]) -> None:
-        idx = self.n
+    def append(self, sample: Mapping[str, np.ndarray], task_id: int, init_state_id: int) -> int:
+        scene_key = (int(task_id), int(init_state_id))
+        scene_group = self._scene_group(*scene_key)
+        idx = self.scene_counts.get(scene_key, 0)
         for name, value in sample.items():
-            ds = self.group[name]
+            ds = self._require_dataset(scene_group, name, np.asarray(value))
             ds.resize((idx + 1,) + ds.shape[1:])
             ds[idx] = value
+        scene_group.attrs["num_samples"] = int(idx + 1)
+        self.scene_counts[scene_key] = idx + 1
         self.n += 1
+        return self.n - 1
 
     def close(self) -> None:
         self.hf.attrs["num_samples"] = int(self.n)
+        self.hf.attrs["num_scenes"] = int(len(self.scene_counts))
         self.hf.close()
 
 
@@ -888,14 +1658,31 @@ def main() -> None:
     target_map = load_target_map(args.target_object_map_json)
     workspace_min = np.asarray(args.workspace_min, dtype=np.float32)
     workspace_max = np.asarray(args.workspace_max, dtype=np.float32)
+    pose_workspace_min = np.asarray(
+        args.pose_workspace_min if args.pose_workspace_min is not None else args.workspace_min,
+        dtype=np.float32,
+    )
+    pose_workspace_max = np.asarray(
+        args.pose_workspace_max if args.pose_workspace_max is not None else args.workspace_max,
+        dtype=np.float32,
+    )
+    if np.any(pose_workspace_max <= pose_workspace_min):
+        raise ValueError(
+            f"pose workspace max must be greater than min, got {pose_workspace_min} -> {pose_workspace_max}"
+        )
     flip_images = not bool(args.no_flip_camera_images)
     invert_v = not bool(args.no_invert_v)
     debug_vis_dir = Path(args.debug_vis_dir) if args.debug_vis_dir else None
     if debug_vis_dir is not None and not debug_vis_dir.is_absolute():
         debug_vis_dir = repo_root / debug_vis_dir
+    pose_debug_dir = Path(args.pose_debug_dir) if args.pose_debug_dir else None
+    if pose_debug_dir is not None and not pose_debug_dir.is_absolute():
+        pose_debug_dir = repo_root / pose_debug_dir
     debug_vis_every = max(1, int(args.debug_vis_every))
     debug_vis_max = max(0, int(args.debug_vis_max))
     debug_frames_saved = 0
+    pose_debug_max = max(0, int(args.pose_debug_max))
+    pose_debug_saved = 0
 
     print(f"[dataset] repo_root={repo_root}")
     print(f"[dataset] LIBERO_CONFIG_PATH={os.environ.get('LIBERO_CONFIG_PATH')}")
@@ -904,7 +1691,13 @@ def main() -> None:
     task_suite = benchmark_dict[args.task_suite_name](safety_level=args.safety_level)
 
     writer = H5Writer(output_path, n_points=args.n_points, save_jacobian=args.save_jacobian)
-    writer.hf.attrs["schema_version"] = "libero_safety_v0"
+    writer.hf.attrs["schema_version"] = "libero_safety_v1"
+    writer.hf.attrs["h5_layout"] = "tasks/task_xxx/scenes/init_xxx"
+    writer.hf.attrs["pointcloud_frame"] = "world"
+    writer.hf.attrs["fused_source_camera_encoding_json"] = json.dumps(
+        {"0": args.camera_local, "1": args.camera_external},
+        sort_keys=True,
+    )
     writer.hf.attrs["task_suite_name"] = args.task_suite_name
     writer.hf.attrs["safety_level"] = args.safety_level
     writer.hf.attrs["camera_local"] = args.camera_local
@@ -917,17 +1710,40 @@ def main() -> None:
     writer.hf.attrs["exclude_name_patterns_json"] = json.dumps(args.exclude_name_patterns)
     writer.hf.attrs["workspace_min"] = workspace_min
     writer.hf.attrs["workspace_max"] = workspace_max
+    writer.hf.attrs["sampling_mode"] = str(args.sampling_mode)
+    writer.hf.attrs["pose_xy_source"] = str(args.pose_xy_source)
+    writer.hf.attrs["pose_table_margin"] = float(args.pose_table_margin)
+    writer.hf.attrs["pose_workspace_min"] = pose_workspace_min
+    writer.hf.attrs["pose_workspace_max"] = pose_workspace_max
+    writer.hf.attrs["ee_orientation_delta_range_deg"] = np.asarray(
+        args.ee_orientation_delta_range_deg,
+        dtype=np.float32,
+    )
+    writer.hf.attrs["ik_position_tol"] = float(args.ik_position_tol)
+    writer.hf.attrs["ik_orientation_tol"] = float(args.ik_orientation_tol)
+    writer.hf.attrs["collision_margin"] = float(args.collision_margin)
+    writer.hf.attrs["robot_collision_name_patterns_json"] = json.dumps(
+        args.robot_collision_name_patterns
+    )
+    writer.hf.attrs["reject_robot_self_collisions"] = bool(args.reject_robot_self_collisions)
     writer.hf.attrs["depth_is_metric"] = bool(args.depth_is_metric)
     writer.hf.attrs["flip_camera_images"] = bool(flip_images)
     writer.hf.attrs["invert_v"] = bool(invert_v)
     writer.hf.attrs["debug_save_ply"] = bool(args.debug_save_ply)
+    writer.hf.attrs["pose_debug_dir"] = str(pose_debug_dir) if pose_debug_dir else ""
+    writer.hf.attrs["pose_debug_max"] = int(pose_debug_max)
 
     instance_maps: Dict[str, Dict[str, str]] = {}
+    pose_workspace_maps: Dict[str, Dict[str, List[float]]] = {}
     total_skipped_low_points = 0
+    total_pose_attempts = 0
+    total_skipped_ik = 0
+    total_skipped_collision = 0
 
     try:
         for task_id in args.task_indices:
             task = task_suite.get_task(int(task_id))
+            writer.register_task(int(task_id), task.name)
             task_bddl_file = Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
             init_states = task_suite.get_task_init_states(int(task_id))
             init_indices = iter_init_indices(
@@ -947,11 +1763,44 @@ def main() -> None:
             }
             env = SegmentationRenderEnv(**env_args)
             env.seed(int(args.seed))
+            task_pose_workspace_min, task_pose_workspace_max = pose_workspace_for_env(
+                env=env,
+                args=args,
+                default_pose_min=pose_workspace_min,
+                default_pose_max=pose_workspace_max,
+            )
+            if np.any(task_pose_workspace_max <= task_pose_workspace_min):
+                raise ValueError(
+                    f"resolved pose workspace max must be greater than min, got "
+                    f"{task_pose_workspace_min} -> {task_pose_workspace_max}"
+                )
+            pose_workspace_maps[str(task_id)] = {
+                "task_name": task.name,
+                "min": task_pose_workspace_min.tolist(),
+                "max": task_pose_workspace_max.tolist(),
+            }
+            ik_frame: Optional[IKFrame] = None
+            qpos_indices: Optional[np.ndarray] = None
+            qvel_indices: Optional[np.ndarray] = None
+            joint_lower: Optional[np.ndarray] = None
+            joint_upper: Optional[np.ndarray] = None
+            if args.sampling_mode == "random_pose" or args.save_jacobian:
+                ik_frame = resolve_ik_frame(env, args)
+                qpos_indices, qvel_indices = robot_joint_indices(env)
+            if args.sampling_mode == "random_pose":
+                assert qpos_indices is not None
+                joint_lower, joint_upper = robot_joint_limits(env, qpos_indices)
 
             print(
                 f"[dataset] task_id={task_id} name={task.name} "
                 f"targets={target_names or 'NONE'} init_states={len(init_indices)}"
             )
+            if ik_frame is not None:
+                frame_role = "random_pose IK" if args.sampling_mode == "random_pose" else "jacobian"
+                print(
+                    f"[dataset] {frame_role} frame={ik_frame.kind}:{ik_frame.name} "
+                    f"pose_workspace={task_pose_workspace_min.tolist()}->{task_pose_workspace_max.tolist()}"
+                )
 
             try:
                 for init_id in tqdm_or_plain(init_indices, desc=f"task {task_id} init", leave=True):
@@ -969,9 +1818,87 @@ def main() -> None:
                         exclude_patterns=args.exclude_name_patterns,
                     )
 
-                    for rollout_step in range(int(args.samples_per_init_state)):
-                        if rollout_step > 0:
-                            obs, _, _, _ = env.step(random_action(args, rng))
+                    base_state = env.get_sim_state()
+                    if args.ee_orientation_reference_quat_xyzw is None:
+                        reference_quat_xyzw = np.asarray(obs["robot0_eef_quat"], dtype=np.float32)
+                    else:
+                        reference_quat_xyzw = np.asarray(
+                            args.ee_orientation_reference_quat_xyzw,
+                            dtype=np.float32,
+                        )
+                    reference_quat_xyzw = normalize_quat(reference_quat_xyzw).astype(np.float32)
+
+                    saved_for_init = 0
+                    attempts_for_init = 0
+                    max_attempts_for_init = (
+                        int(args.samples_per_init_state)
+                        * max(1, int(args.max_pose_attempts_per_sample))
+                    )
+                    while (
+                        saved_for_init < int(args.samples_per_init_state)
+                        and attempts_for_init < max_attempts_for_init
+                    ):
+                        attempts_for_init += 1
+                        rollout_step = saved_for_init
+                        pose_debug: Dict[str, Any] = {
+                            "pose_attempt": int(attempts_for_init),
+                            "sampling_mode": str(args.sampling_mode),
+                        }
+
+                        if args.sampling_mode == "random_pose":
+                            assert ik_frame is not None
+                            assert qpos_indices is not None
+                            assert qvel_indices is not None
+                            assert joint_lower is not None
+                            assert joint_upper is not None
+
+                            env.regenerate_obs_from_state(base_state)
+                            target_pos, target_quat, target_delta_euler = sample_random_ee_pose(
+                                rng=rng,
+                                pose_workspace_min=task_pose_workspace_min,
+                                pose_workspace_max=task_pose_workspace_max,
+                                reference_quat_xyzw=reference_quat_xyzw,
+                                orientation_delta_range_deg=args.ee_orientation_delta_range_deg,
+                            )
+                            total_pose_attempts += 1
+                            ik_result = solve_ik_to_pose(
+                                env=env,
+                                target_pos=target_pos,
+                                target_quat_xyzw=target_quat,
+                                frame=ik_frame,
+                                qpos_indices=qpos_indices,
+                                qvel_indices=qvel_indices,
+                                joint_lower=joint_lower,
+                                joint_upper=joint_upper,
+                                args=args,
+                            )
+                            pose_debug.update(
+                                {
+                                    "target_ee_pos_world": target_pos.tolist(),
+                                    "target_ee_quat_xyzw": target_quat.tolist(),
+                                    "target_delta_euler_xyz_rad": target_delta_euler.tolist(),
+                                    "ik_pos_error": float(ik_result.pos_error),
+                                    "ik_ori_error": float(ik_result.ori_error),
+                                    "ik_iterations": int(ik_result.iterations),
+                                }
+                            )
+                            if not ik_result.success:
+                                total_skipped_ik += 1
+                                continue
+
+                            collisions = robot_collision_contacts(
+                                env=env,
+                                robot_patterns=args.robot_collision_name_patterns,
+                                margin=float(args.collision_margin),
+                                reject_robot_self_collisions=bool(args.reject_robot_self_collisions),
+                            )
+                            if collisions:
+                                total_skipped_collision += 1
+                                continue
+                            obs = env.regenerate_obs_from_state(env.get_sim_state())
+                        else:
+                            if attempts_for_init > 1:
+                                obs, _, _, _ = env.step(random_action(args, rng))
 
                         wrist_raw = camera_cloud_from_obs(
                             obs=obs,
@@ -1025,18 +1952,33 @@ def main() -> None:
                             ee_radius=float(args.ee_radius),
                         )
 
-                        print(s_star, d_obs)
+                        fused_pointcloud = np.concatenate(
+                            [wrist_sample.world, ext_sample.world],
+                            axis=0,
+                        ).astype(np.float32)
+                        fused_object_ids = np.concatenate(
+                            [wrist_sample.instance_ids, ext_sample.instance_ids],
+                            axis=0,
+                        ).astype(np.int32)
+                        fused_source_camera = np.concatenate(
+                            [
+                                np.zeros((int(args.n_points),), dtype=np.int8),
+                                np.ones((int(args.n_points),), dtype=np.int8),
+                            ],
+                            axis=0,
+                        )
 
                         sample: Dict[str, np.ndarray] = {
                             "q": q,
                             "ee_pos_world": ee_pos,
                             "ee_ori_world": ee_quat,
-                            "pointcloud_wrist_local": wrist_sample.local,
-                            "pointcloud_wrist_world": wrist_sample.world,
-                            "pointcloud_ext_local": ext_sample.local,
-                            "pointcloud_ext_world": ext_sample.world,
-                            "point_object_id_wrist": wrist_sample.instance_ids,
-                            "point_object_id_ext": ext_sample.instance_ids,
+                            "ee/pointcloud": wrist_sample.world,
+                            "ee/point_object_id": wrist_sample.instance_ids,
+                            "backview/pointcloud": ext_sample.world,
+                            "backview/point_object_id": ext_sample.instance_ids,
+                            "fused_pointcloud/pointcloud": fused_pointcloud,
+                            "fused_pointcloud/point_object_id": fused_object_ids,
+                            "fused_pointcloud/source_camera": fused_source_camera,
                             "S_star_obs": s_star,
                             "d_obs_hard": d_obs,
                             "v_rep": v_rep,
@@ -1045,24 +1987,36 @@ def main() -> None:
                             "rollout_step": np.asarray([rollout_step], dtype=np.int32),
                         }
                         if args.save_jacobian:
-                            sample["J_ee"] = compute_jacobian(env)
+                            sample["J_ee"] = compute_jacobian(env, ik_frame, qvel_indices)
 
-                        writer.append(sample)
+                        sample_index = writer.append(
+                            sample,
+                            task_id=int(task_id),
+                            init_state_id=int(init_id),
+                        )
+                        debug_metadata = {
+                            "task_id": int(task_id),
+                            "task_name": task.name,
+                            "init_state_id": int(init_id),
+                            "rollout_step": int(rollout_step),
+                            "sample_index": int(sample_index),
+                            "S_star_obs": float(s_star[0]),
+                            "d_obs_hard": float(d_obs[0]),
+                            "ee_pos_world": ee_pos.tolist(),
+                            "ee_quat_xyzw": ee_quat.tolist(),
+                            "q": q.tolist(),
+                            "camera_ee": args.camera_local,
+                            "camera_backview": args.camera_external,
+                            "ee_point_count": int(wrist.world.shape[0]),
+                            "backview_point_count": int(ext.world.shape[0]),
+                        }
+                        debug_metadata.update(pose_debug)
 
                         if (
                             debug_vis_dir is not None
                             and debug_frames_saved < debug_vis_max
                             and writer.n % debug_vis_every == 0
                         ):
-                            debug_metadata = {
-                                "task_id": int(task_id),
-                                "task_name": task.name,
-                                "init_state_id": int(init_id),
-                                "rollout_step": int(rollout_step),
-                                "sample_index": int(writer.n - 1),
-                                "S_star_obs": float(s_star[0]),
-                                "d_obs_hard": float(d_obs[0]),
-                            }
                             save_debug_frame(
                                 obs=obs,
                                 camera_names=[args.camera_local, args.camera_external],
@@ -1083,21 +2037,64 @@ def main() -> None:
                                 max_points=int(args.debug_pointcloud_max_points),
                                 rng=rng,
                                 save_ply=bool(args.debug_save_ply),
+                                ee_quat_world=ee_quat,
                             )
                             debug_frames_saved += 1
+
+                        if pose_debug_dir is not None and pose_debug_saved < pose_debug_max:
+                            save_pose_sampling_debug_sample(
+                                obs=obs,
+                                ee_cloud=wrist,
+                                backview_cloud=ext,
+                                output_dir=pose_debug_dir,
+                                sample_idx=pose_debug_saved,
+                                metadata=debug_metadata,
+                                keep_ids=keep_ids,
+                                camera_ee=args.camera_local,
+                                camera_backview=args.camera_external,
+                                flip_images=flip_images,
+                                max_points=int(args.debug_pointcloud_max_points),
+                                rng=rng,
+                            )
+                            pose_debug_saved += 1
+                        saved_for_init += 1
+
+                    if saved_for_init < int(args.samples_per_init_state):
+                        print(
+                            f"[dataset] warning: saved {saved_for_init}/"
+                            f"{int(args.samples_per_init_state)} samples for "
+                            f"task_id={task_id} init_state={init_id} after "
+                            f"{attempts_for_init} attempts"
+                        )
             finally:
                 env.close()
 
     finally:
         writer.hf.attrs["instance_maps_json"] = json.dumps(instance_maps, sort_keys=True)
+        writer.hf.attrs["resolved_pose_workspaces_json"] = json.dumps(
+            pose_workspace_maps,
+            sort_keys=True,
+        )
         writer.hf.attrs["skipped_low_obstacle_points"] = int(total_skipped_low_points)
+        writer.hf.attrs["pose_sampling_attempts"] = int(total_pose_attempts)
+        writer.hf.attrs["skipped_ik"] = int(total_skipped_ik)
+        writer.hf.attrs["skipped_collision"] = int(total_skipped_collision)
         writer.hf.attrs["debug_frames_saved"] = int(debug_frames_saved)
+        writer.hf.attrs["pose_debug_saved"] = int(pose_debug_saved)
         writer.close()
 
     print(f"[dataset] wrote {writer.n} samples to {output_path}")
     print(f"[dataset] skipped_low_obstacle_points={total_skipped_low_points}")
+    if args.sampling_mode == "random_pose":
+        print(
+            f"[dataset] pose attempts={total_pose_attempts} "
+            f"skipped_ik={total_skipped_ik} skipped_collision={total_skipped_collision}"
+        )
     if debug_vis_dir is not None:
         print(f"[dataset] debug frames saved: {debug_frames_saved} in {debug_vis_dir}")
+    if pose_debug_dir is not None:
+        print(f"[dataset] pose debug samples saved: {pose_debug_saved} in {pose_debug_dir}")
+
 
 
 if __name__ == "__main__":
