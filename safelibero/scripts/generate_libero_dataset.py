@@ -74,6 +74,21 @@ class IKResult:
     iterations: int
 
 
+@dataclass(frozen=True)
+class SafetyTargets:
+    S_star_obs: np.ndarray
+    S_star_hard: np.ndarray
+    S_star_knn: np.ndarray
+    S_star_robust: np.ndarray
+    d_obs: np.ndarray
+    d_obs_hard: np.ndarray
+    d_obs_knn: np.ndarray
+    d_obs_robust: np.ndarray
+    v_rep: np.ndarray
+    v_rep_knn: np.ndarray
+    closest_point_idx: np.ndarray
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect pointcloud/q/EE safety samples from SafeLIBERO scenes."
@@ -98,7 +113,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-obstacle-points", type=int, default=32)
     parser.add_argument("--d-max", type=float, default=0.3)
     parser.add_argument("--d-min", type=float, default=0.0)
-    parser.add_argument("--ee-radius", type=float, default=0.00)
+    parser.add_argument(
+        "--safety-distance-mode",
+        choices=["hard", "knn", "knn_capped"],
+        default="knn_capped",
+        help="Which distance label is used for S_star_obs. Hard uses min distance; knn/knn_capped are robust to isolated noisy points.",
+    )
+    parser.add_argument(
+        "--safety-knn-k",
+        type=int,
+        default=8,
+        help="Number of closest obstacle points averaged for robust safety distance.",
+    )
+    parser.add_argument(
+        "--safety-robust-cap",
+        type=float,
+        default=0.02,
+        help="Max meters that knn_capped may exceed hard distance.",
+    )
+    parser.add_argument(
+        "--ee-radius",
+        type=float,
+        default=0.07,
+        help="Half-width of the EE safety box, or sphere radius when --ee-safety-geometry=eef_sphere.",
+    )
+    parser.add_argument(
+        "--ee-safety-geometry",
+        choices=["eef_sphere", "camera_to_eef_box"],
+        default="camera_to_eef_box",
+        help="Geometry used for S_star/d_obs. camera_to_eef_box covers the segment from wrist camera to gripper TCP.",
+    )
     parser.add_argument("--translation-action-scale", type=float, default=0.025)
     parser.add_argument("--rotation-action-scale", type=float, default=0.08)
     parser.add_argument("--gripper-action", type=float, default=-1.0)
@@ -244,7 +288,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional structured pose-sampling debug root. Saves ee/rgb, ee/pointcloud, "
-            "backview/rgb, backview/pointcloud, and fused_pointcloud outputs."
+            "backview/rgb, backview/pointcloud, fused_pointcloud/rgb, and "
+            "fused_pointcloud/pointcloud outputs."
         ),
     )
     parser.add_argument(
@@ -718,6 +763,297 @@ def set_axes_equal_3d(ax: Any, points: np.ndarray, center: Optional[np.ndarray] 
     ax.set_zlim(mid[2] - radius, mid[2] + radius)
 
 
+def ee_volume_points_from_metadata(metadata: Mapping[str, Any]) -> np.ndarray:
+    if "ee_volume_start_world" not in metadata or "ee_volume_end_world" not in metadata:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.stack(
+        [
+            np.asarray(metadata["ee_volume_start_world"], dtype=np.float32).reshape(3),
+            np.asarray(metadata["ee_volume_end_world"], dtype=np.float32).reshape(3),
+        ],
+        axis=0,
+    )
+
+
+def box_frame_between_points(
+    start_world: np.ndarray,
+    end_world: np.ndarray,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, float]]:
+    start = np.asarray(start_world, dtype=np.float32).reshape(3)
+    end = np.asarray(end_world, dtype=np.float32).reshape(3)
+    axis = end - start
+    length = float(np.linalg.norm(axis))
+    if length < 1e-8:
+        return None
+
+    direction = axis / length
+    reference = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    if abs(float(np.dot(direction, reference))) > 0.95:
+        reference = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    basis_u = np.cross(direction, reference)
+    basis_u /= max(float(np.linalg.norm(basis_u)), 1e-8)
+    basis_v = np.cross(direction, basis_u)
+    return direction.astype(np.float32), basis_u.astype(np.float32), basis_v.astype(np.float32), length
+
+
+def box_corners_between_points(
+    start_world: np.ndarray,
+    end_world: np.ndarray,
+    half_width: float,
+) -> np.ndarray:
+    start = np.asarray(start_world, dtype=np.float32).reshape(3)
+    frame = box_frame_between_points(start_world, end_world)
+    if frame is None or float(half_width) <= 0.0:
+        return np.zeros((0, 3), dtype=np.float32)
+    direction, basis_u, basis_v, length = frame
+    corners = []
+    for x in (0.0, length):
+        center = start + x * direction
+        for u in (-float(half_width), float(half_width)):
+            for v in (-float(half_width), float(half_width)):
+                corners.append(center + u * basis_u + v * basis_v)
+    return np.asarray(corners, dtype=np.float32)
+
+
+def box_surface_points(
+    start_world: np.ndarray,
+    end_world: np.ndarray,
+    half_width: float,
+    width_steps: int = 12,
+    length_steps: int = 32,
+) -> np.ndarray:
+    start = np.asarray(start_world, dtype=np.float32).reshape(3)
+    end = np.asarray(end_world, dtype=np.float32).reshape(3)
+    frame = box_frame_between_points(start, end)
+    if frame is None or float(half_width) <= 0.0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    direction, basis_u, basis_v, length = frame
+    half = float(half_width)
+    along = np.linspace(0.0, length, max(2, int(length_steps)), dtype=np.float32)
+    cross = np.linspace(-half, half, max(2, int(width_steps)), dtype=np.float32)
+    along_grid, cross_grid = np.meshgrid(along, cross, indexing="ij")
+    points = []
+    for sign in (-1.0, 1.0):
+        points.append(
+            start.reshape(1, 1, 3)
+            + along_grid[..., None] * direction.reshape(1, 1, 3)
+            + sign * half * basis_u.reshape(1, 1, 3)
+            + cross_grid[..., None] * basis_v.reshape(1, 1, 3)
+        )
+        points.append(
+            start.reshape(1, 1, 3)
+            + along_grid[..., None] * direction.reshape(1, 1, 3)
+            + cross_grid[..., None] * basis_u.reshape(1, 1, 3)
+            + sign * half * basis_v.reshape(1, 1, 3)
+        )
+
+    cap_u, cap_v = np.meshgrid(cross, cross, indexing="ij")
+    for center in (start, end):
+        points.append(
+            center.reshape(1, 1, 3)
+            + cap_u[..., None] * basis_u.reshape(1, 1, 3)
+            + cap_v[..., None] * basis_v.reshape(1, 1, 3)
+        )
+
+    return np.concatenate([point.reshape(-1, 3) for point in points], axis=0).astype(np.float32)
+
+
+def box_edge_points(
+    start_world: np.ndarray,
+    end_world: np.ndarray,
+    half_width: float,
+    steps: int = 48,
+) -> np.ndarray:
+    corners = box_corners_between_points(start_world, end_world, half_width)
+    if corners.shape[0] != 8:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    edge_pairs = [
+        (0, 1),
+        (0, 2),
+        (1, 3),
+        (2, 3),
+        (4, 5),
+        (4, 6),
+        (5, 7),
+        (6, 7),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
+    edge_points = []
+    t = np.linspace(0.0, 1.0, max(2, int(steps)), dtype=np.float32).reshape(-1, 1)
+    for start_idx, end_idx in edge_pairs:
+        edge_points.append((1.0 - t) * corners[start_idx].reshape(1, 3) + t * corners[end_idx].reshape(1, 3))
+    return np.concatenate(edge_points, axis=0).astype(np.float32)
+
+
+def plot_box_between_points(
+    ax: Any,
+    start_world: np.ndarray,
+    end_world: np.ndarray,
+    half_width: float,
+    color: str = "#9467bd",
+    alpha: float = 0.22,
+) -> None:
+    corners = box_corners_between_points(start_world, end_world, half_width)
+    if corners.shape[0] != 8:
+        return
+
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    faces = [
+        [corners[i] for i in (0, 1, 3, 2)],
+        [corners[i] for i in (4, 6, 7, 5)],
+        [corners[i] for i in (0, 4, 5, 1)],
+        [corners[i] for i in (2, 3, 7, 6)],
+        [corners[i] for i in (0, 2, 6, 4)],
+        [corners[i] for i in (1, 5, 7, 3)],
+    ]
+    collection = Poly3DCollection(
+        faces,
+        facecolors=color,
+        edgecolors=color,
+        linewidths=1.0,
+        alpha=alpha,
+    )
+    ax.add_collection3d(collection)
+    edges = box_edge_points(start_world, end_world, half_width, steps=2).reshape(12, 2, 3)
+    for edge in edges:
+        ax.plot(edge[:, 0], edge[:, 1], edge[:, 2], c=color, linewidth=1.0, alpha=0.9)
+    start = np.asarray(start_world, dtype=np.float32).reshape(3)
+    end = np.asarray(end_world, dtype=np.float32).reshape(3)
+    ax.plot(
+        [start[0], end[0]],
+        [start[1], end[1]],
+        [start[2], end[2]],
+        c=color,
+        linewidth=2.0,
+        label="EE box",
+    )
+
+
+def project_world_points_to_image(
+    points_world: np.ndarray,
+    env: Any,
+    camera_name: str,
+    camera_utils: Any,
+    image_shape: Tuple[int, int],
+    flip_images: bool,
+) -> np.ndarray:
+    points = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
+    if points.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    height, width = int(image_shape[0]), int(image_shape[1])
+    intrinsics = camera_utils.get_camera_intrinsic_matrix(env.sim, camera_name, height, width)
+    extrinsics = camera_utils.get_camera_extrinsic_matrix(env.sim, camera_name)
+    world_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1).T
+    camera_points = (np.linalg.inv(extrinsics) @ world_h)[:3]
+
+    # Inverse of camera_cloud_from_obs: its projection path flips local y before world transform.
+    pixels_camera = camera_points.copy()
+    pixels_camera[1, :] *= -1.0
+    in_front = pixels_camera[2, :] > 1e-6
+    if not np.any(in_front):
+        return np.zeros((0, 2), dtype=np.int32)
+
+    pixel_h = intrinsics @ pixels_camera[:, in_front]
+    u = pixel_h[0, :] / pixel_h[2, :]
+    v = pixel_h[1, :] / pixel_h[2, :]
+    if flip_images:
+        v = float(height - 1) - v
+
+    valid = np.isfinite(u) & np.isfinite(v)
+    valid &= u >= 0.0
+    valid &= u < float(width)
+    valid &= v >= 0.0
+    valid &= v < float(height)
+    if not np.any(valid):
+        return np.zeros((0, 2), dtype=np.int32)
+
+    return np.stack([np.rint(u[valid]), np.rint(v[valid])], axis=1).astype(np.int32)
+
+
+def blend_disc(image: np.ndarray, center_uv: np.ndarray, radius_px: int, color: Sequence[int], alpha: float) -> None:
+    height, width = image.shape[:2]
+    u, v = int(center_uv[0]), int(center_uv[1])
+    radius_px = max(1, int(radius_px))
+    u0, u1 = max(0, u - radius_px), min(width - 1, u + radius_px)
+    v0, v1 = max(0, v - radius_px), min(height - 1, v + radius_px)
+    color_arr = np.asarray(color, dtype=np.float32).reshape(1, 1, 3)
+    for yy in range(v0, v1 + 1):
+        for xx in range(u0, u1 + 1):
+            if (xx - u) ** 2 + (yy - v) ** 2 <= radius_px**2:
+                base = image[yy, xx].astype(np.float32)
+                image[yy, xx] = np.clip((1.0 - alpha) * base + alpha * color_arr.reshape(3), 0, 255)
+
+
+def draw_projected_points(
+    image: np.ndarray,
+    pixels_uv: np.ndarray,
+    color: Sequence[int],
+    radius_px: int,
+    alpha: float,
+) -> np.ndarray:
+    output = image.copy()
+    for pixel in np.asarray(pixels_uv, dtype=np.int32).reshape(-1, 2):
+        blend_disc(output, pixel, radius_px=radius_px, color=color, alpha=alpha)
+    return output
+
+
+def overlay_ee_box_on_rgb(
+    rgb: np.ndarray,
+    env: Any,
+    camera_name: str,
+    camera_utils: Any,
+    metadata: Mapping[str, Any],
+    flip_images: bool,
+) -> np.ndarray:
+    volume_points = ee_volume_points_from_metadata(metadata)
+    if volume_points.shape[0] != 2:
+        return rgb
+    half_width = float(metadata.get("ee_volume_half_width", metadata.get("ee_volume_radius", 0.0)))
+    if half_width <= 0.0:
+        return rgb
+
+    surface_world = box_surface_points(volume_points[0], volume_points[1], half_width)
+    axis_world = np.linspace(volume_points[0], volume_points[1], 80).astype(np.float32)
+    edge_world = box_edge_points(volume_points[0], volume_points[1], half_width)
+
+    surface_uv = project_world_points_to_image(
+        surface_world,
+        env=env,
+        camera_name=camera_name,
+        camera_utils=camera_utils,
+        image_shape=rgb.shape[:2],
+        flip_images=flip_images,
+    )
+    axis_uv = project_world_points_to_image(
+        axis_world,
+        env=env,
+        camera_name=camera_name,
+        camera_utils=camera_utils,
+        image_shape=rgb.shape[:2],
+        flip_images=flip_images,
+    )
+    edge_uv = project_world_points_to_image(
+        edge_world,
+        env=env,
+        camera_name=camera_name,
+        camera_utils=camera_utils,
+        image_shape=rgb.shape[:2],
+        flip_images=flip_images,
+    )
+
+    overlay = draw_projected_points(rgb, surface_uv, color=(155, 70, 255), radius_px=2, alpha=0.28)
+    overlay = draw_projected_points(overlay, edge_uv, color=(210, 170, 255), radius_px=2, alpha=0.65)
+    overlay = draw_projected_points(overlay, axis_uv, color=(255, 255, 40), radius_px=2, alpha=0.8)
+    return overlay.astype(np.uint8)
+
+
 def write_ascii_ply(path: Path, points: np.ndarray, color: Tuple[int, int, int]) -> None:
     points = np.asarray(points, dtype=np.float32)
     valid = np.isfinite(points).all(axis=1)
@@ -736,6 +1072,32 @@ def write_ascii_ply(path: Path, points: np.ndarray, color: Tuple[int, int, int])
         f.write("end_header\n")
         r, g, b = color
         for point in points:
+            f.write(f"{point[0]:.7f} {point[1]:.7f} {point[2]:.7f} {r} {g} {b}\n")
+
+
+def write_ascii_ply_with_colors(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
+    points = np.asarray(points, dtype=np.float32)
+    colors = np.asarray(colors, dtype=np.uint8)
+    if points.shape[0] != colors.shape[0]:
+        raise ValueError(f"points/colors length mismatch: {points.shape[0]} vs {colors.shape[0]}")
+
+    valid = np.isfinite(points).all(axis=1)
+    points = points[valid]
+    colors = colors[valid]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {points.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for point, color in zip(points, colors):
+            r, g, b = [int(x) for x in color]
             f.write(f"{point[0]:.7f} {point[1]:.7f} {point[2]:.7f} {r} {g} {b}\n")
 
 
@@ -783,7 +1145,20 @@ def save_fused_pointcloud_debug_png(
 
     ee = np.asarray(ee_pos_world, dtype=np.float32).reshape(3)
     ax.scatter([ee[0]], [ee[1]], [ee[2]], s=45, c="#d62728", marker="o", label="EE")
-    set_axes_equal_3d(ax, all_points, ee)
+    volume_points = ee_volume_points_from_metadata(metadata)
+    if volume_points.shape[0] == 2:
+        plot_box_between_points(
+            ax=ax,
+            start_world=volume_points[0],
+            end_world=volume_points[1],
+            half_width=float(metadata.get("ee_volume_half_width", metadata.get("ee_volume_radius", 0.0))),
+        )
+    bounds_points = (
+        np.concatenate([all_points, volume_points], axis=0)
+        if volume_points.shape[0] > 0
+        else all_points
+    )
+    set_axes_equal_3d(ax, bounds_points, ee)
     ax.view_init(elev=24, azim=-55)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
@@ -802,6 +1177,8 @@ def save_fused_pointcloud_debug_png(
 
 def save_pose_sampling_debug_sample(
     obs: Mapping[str, Any],
+    env: Any,
+    camera_utils: Any,
     ee_cloud: CameraCloud,
     backview_cloud: CameraCloud,
     output_dir: Path,
@@ -823,22 +1200,41 @@ def save_pose_sampling_debug_sample(
     ee_ply_path = output_dir / "ee" / "pointcloud" / f"{stem}.ply"
     back_rgb_path = output_dir / "backview" / "rgb" / f"{stem}.png"
     back_ply_path = output_dir / "backview" / "pointcloud" / f"{stem}.ply"
-    fused_path = output_dir / "fused_pointcloud" / f"{stem}.png"
+    fused_rgb_path = output_dir / "fused_pointcloud" / "rgb" / f"{stem}.png"
+    fused_ply_path = output_dir / "fused_pointcloud" / "pointcloud" / f"{stem}.ply"
 
     ee_rgb_path.parent.mkdir(parents=True, exist_ok=True)
     back_rgb_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(ee_rgb_path, semantic_rgb_from_obs(obs, camera_ee, keep_ids, flip_images))
+    backview_rgb = semantic_rgb_from_obs(obs, camera_backview, keep_ids, flip_images)
+    backview_rgb = overlay_ee_box_on_rgb(
+        rgb=backview_rgb,
+        env=env,
+        camera_name=camera_backview,
+        camera_utils=camera_utils,
+        metadata=metadata,
+        flip_images=flip_images,
+    )
     imageio.imwrite(
         back_rgb_path,
-        semantic_rgb_from_obs(obs, camera_backview, keep_ids, flip_images),
+        backview_rgb,
     )
     write_ascii_ply(ee_ply_path, ee_cloud.world, (31, 119, 180))
     write_ascii_ply(back_ply_path, backview_cloud.world, (255, 127, 14))
+    fused_points = np.concatenate([ee_cloud.world, backview_cloud.world], axis=0).astype(np.float32)
+    fused_colors = np.concatenate(
+        [
+            np.tile(np.asarray([31, 119, 180], dtype=np.uint8), (ee_cloud.world.shape[0], 1)),
+            np.tile(np.asarray([255, 127, 14], dtype=np.uint8), (backview_cloud.world.shape[0], 1)),
+        ],
+        axis=0,
+    )
+    write_ascii_ply_with_colors(fused_ply_path, fused_points, fused_colors)
     save_fused_pointcloud_debug_png(
         ee_cloud=ee_cloud,
         backview_cloud=backview_cloud,
         ee_pos_world=np.asarray(metadata["ee_pos_world"], dtype=np.float32),
-        output_path=fused_path,
+        output_path=fused_rgb_path,
         metadata=metadata,
         max_points=max_points,
         rng=rng,
@@ -851,8 +1247,11 @@ def save_pose_sampling_debug_sample(
             "ee_pointcloud": str(ee_ply_path.relative_to(output_dir)),
             "backview_rgb": str(back_rgb_path.relative_to(output_dir)),
             "backview_pointcloud": str(back_ply_path.relative_to(output_dir)),
-            "fused_pointcloud": str(fused_path.relative_to(output_dir)),
+            "fused_pointcloud": str(fused_rgb_path.relative_to(output_dir)),
+            "fused_pointcloud_rgb": str(fused_rgb_path.relative_to(output_dir)),
+            "fused_pointcloud_ply": str(fused_ply_path.relative_to(output_dir)),
             "rgb_semantic_overlay": True,
+            "backview_rgb_ee_box_overlay": True,
             "semantic_keep_ids": [int(x) for x in keep_ids.tolist()],
         }
     )
@@ -905,6 +1304,14 @@ def save_debug_pointcloud_frame(
         if ee_center is not None:
             ee = np.asarray(ee_center, dtype=np.float32).reshape(3)
             ax.scatter([ee[0]], [ee[1]], [ee[2]], s=45, c="#d62728", marker="o", label="EE")
+            volume_points = ee_volume_points_from_metadata(metadata)
+            if volume_points.shape[0] == 2:
+                plot_box_between_points(
+                    ax=ax,
+                    start_world=volume_points[0],
+                    end_world=volume_points[1],
+                    half_width=float(metadata.get("ee_volume_half_width", metadata.get("ee_volume_radius", 0.0))),
+                )
             rep = np.asarray(v_rep_world, dtype=np.float32).reshape(3)
             ax.quiver(ee[0], ee[1], ee[2], rep[0], rep[1], rep[2], length=0.12, color="#2ca02c")
             if ee_quat_world is not None:
@@ -926,12 +1333,19 @@ def save_debug_pointcloud_frame(
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_zlabel("z")
-        set_axes_equal_3d(ax, points, ee_center)
+        volume_points = ee_volume_points_from_metadata(metadata) if ee_center is not None else np.zeros((0, 3))
+        bounds_points = (
+            np.concatenate([points, volume_points], axis=0)
+            if volume_points.shape[0] > 0
+            else points
+        )
+        set_axes_equal_3d(ax, bounds_points, ee_center)
         ax.view_init(elev=24, azim=-55)
 
     fig.suptitle(
         f"task={metadata['task_id']} init={metadata['init_state_id']} "
-        f"step={metadata['rollout_step']} S={metadata['S_star_obs']:.3f} d={metadata['d_obs_hard']:.3f}"
+        f"step={metadata['rollout_step']} S={metadata['S_star_obs']:.3f} "
+        f"d={metadata['d_obs']:.3f} hard={metadata['d_obs_hard']:.3f}"
     )
     fig.tight_layout()
 
@@ -988,27 +1402,157 @@ def sample_or_pad_cloud(
     )
 
 
+def camera_position_world(env: Any, camera_name: str) -> np.ndarray:
+    camera_id = int(env.sim.model.camera_name2id(camera_name))
+    return np.asarray(env.sim.data.cam_xpos[camera_id], dtype=np.float32).reshape(3)
+
+
+def point_to_oriented_box_vectors_and_distances(
+    points_world: np.ndarray,
+    box_start_world: np.ndarray,
+    box_end_world: np.ndarray,
+    half_width: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    points = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
+    start = np.asarray(box_start_world, dtype=np.float32).reshape(3)
+    end = np.asarray(box_end_world, dtype=np.float32).reshape(3)
+    half = max(0.0, float(half_width))
+    frame = box_frame_between_points(start, end)
+    if frame is None or half <= 0.0:
+        delta = end.reshape(1, 3) - points
+        return delta.astype(np.float32), np.linalg.norm(delta, axis=1).astype(np.float32)
+
+    direction, basis_u, basis_v, length = frame
+    rel = points - start.reshape(1, 3)
+    local_x = rel @ direction
+    local_y = rel @ basis_u
+    local_z = rel @ basis_v
+
+    closest_x = np.clip(local_x, 0.0, length)
+    closest_y = np.clip(local_y, -half, half)
+    closest_z = np.clip(local_z, -half, half)
+    closest = (
+        start.reshape(1, 3)
+        + closest_x.reshape(-1, 1) * direction.reshape(1, 3)
+        + closest_y.reshape(-1, 1) * basis_u.reshape(1, 3)
+        + closest_z.reshape(-1, 1) * basis_v.reshape(1, 3)
+    )
+    vectors = closest - points
+    distances = np.linalg.norm(vectors, axis=1)
+
+    inside = (
+        (local_x >= 0.0)
+        & (local_x <= length)
+        & (local_y >= -half)
+        & (local_y <= half)
+        & (local_z >= -half)
+        & (local_z <= half)
+    )
+    if np.any(inside):
+        local = np.stack([local_x, local_y, local_z], axis=1)
+        face_distances = np.stack(
+            [
+                local[:, 0],
+                length - local[:, 0],
+                local[:, 1] + half,
+                half - local[:, 1],
+                local[:, 2] + half,
+                half - local[:, 2],
+            ],
+            axis=1,
+        )
+        nearest_face = np.argmin(face_distances[inside], axis=1)
+        inside_indices = np.flatnonzero(inside)
+        inside_vectors = np.zeros((inside_indices.shape[0], 3), dtype=np.float32)
+        face_dirs = np.asarray(
+            [
+                -direction,
+                direction,
+                -basis_u,
+                basis_u,
+                -basis_v,
+                basis_v,
+            ],
+            dtype=np.float32,
+        )
+        for local_idx, face_idx in enumerate(nearest_face):
+            inside_vectors[local_idx] = face_dirs[int(face_idx)] * face_distances[
+                inside_indices[local_idx], int(face_idx)
+            ]
+        vectors[inside_indices] = inside_vectors
+        distances[inside_indices] = 0.0
+
+    return vectors.astype(np.float32), distances.astype(np.float32)
+
+
 def compute_safety_targets(
     points_world: np.ndarray,
     ee_pos_world: np.ndarray,
     d_max: float,
     d_min: float,
     ee_radius: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ee_safety_geometry: str = "eef_sphere",
+    ee_volume_start_world: Optional[np.ndarray] = None,
+    ee_volume_end_world: Optional[np.ndarray] = None,
+    safety_distance_mode: str = "hard",
+    safety_knn_k: int = 8,
+    safety_robust_cap: float = 0.02,
+) -> SafetyTargets:
     if points_world.shape[0] == 0:
-        return (
-            np.asarray([1.0], dtype=np.float32),
-            np.asarray([1e6], dtype=np.float32),
-            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        return SafetyTargets(
+            S_star_obs=np.asarray([1.0], dtype=np.float32),
+            S_star_hard=np.asarray([1.0], dtype=np.float32),
+            S_star_knn=np.asarray([1.0], dtype=np.float32),
+            S_star_robust=np.asarray([1.0], dtype=np.float32),
+            d_obs=np.asarray([1e6], dtype=np.float32),
+            d_obs_hard=np.asarray([1e6], dtype=np.float32),
+            d_obs_knn=np.asarray([1e6], dtype=np.float32),
+            d_obs_robust=np.asarray([1e6], dtype=np.float32),
+            v_rep=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            v_rep_knn=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            closest_point_idx=np.asarray([-1], dtype=np.int32),
         )
 
-    ee = ee_pos_world.reshape(1, 3).astype(np.float32)
-    delta = ee - points_world.astype(np.float32)
-    distances = np.linalg.norm(delta, axis=1)
+    if ee_safety_geometry == "camera_to_eef_box":
+        if ee_volume_start_world is None or ee_volume_end_world is None:
+            raise ValueError("camera_to_eef_box requires EE volume start and end positions.")
+        delta, distances = point_to_oriented_box_vectors_and_distances(
+            points_world=points_world,
+            box_start_world=ee_volume_start_world,
+            box_end_world=ee_volume_end_world,
+            half_width=float(ee_radius),
+        )
+        surface_distances = distances
+    elif ee_safety_geometry == "eef_sphere":
+        ee = ee_pos_world.reshape(1, 3).astype(np.float32)
+        delta = ee - points_world.astype(np.float32)
+        distances = np.linalg.norm(delta, axis=1)
+        surface_distances = np.maximum(0.0, distances - float(ee_radius))
+    else:
+        raise ValueError(f"Unknown EE safety geometry: {ee_safety_geometry}")
+
     closest_idx = int(np.argmin(distances))
-    closest_center_dist = float(distances[closest_idx])
-    d_obs = max(0.0, closest_center_dist - float(ee_radius))
-    s_star = float(np.clip(d_obs / float(d_max), float(d_min) / float(d_max), 1.0))
+
+    d_obs_hard = float(surface_distances[closest_idx])
+    knn_k = min(max(1, int(safety_knn_k)), int(surface_distances.shape[0]))
+    nearest_indices = np.argpartition(surface_distances, knn_k - 1)[:knn_k]
+    nearest_surface = surface_distances[nearest_indices]
+    d_obs_knn = float(np.mean(nearest_surface))
+    d_obs_robust = min(d_obs_knn, d_obs_hard + max(0.0, float(safety_robust_cap)))
+    if safety_distance_mode == "hard":
+        d_obs_selected = d_obs_hard
+    elif safety_distance_mode == "knn":
+        d_obs_selected = d_obs_knn
+    elif safety_distance_mode == "knn_capped":
+        d_obs_selected = d_obs_robust
+    else:
+        raise ValueError(f"Unknown safety distance mode: {safety_distance_mode}")
+
+    lower_s = float(d_min) / float(d_max)
+    s_star_hard = float(np.clip(d_obs_hard / float(d_max), lower_s, 1.0))
+    s_star_knn = float(np.clip(d_obs_knn / float(d_max), lower_s, 1.0))
+    s_star_robust = float(np.clip(d_obs_robust / float(d_max), lower_s, 1.0))
+    s_star_obs = float(np.clip(d_obs_selected / float(d_max), lower_s, 1.0))
 
     rep = delta[closest_idx]
     norm = float(np.linalg.norm(rep))
@@ -1017,10 +1561,36 @@ def compute_safety_targets(
     else:
         rep = (rep / norm).astype(np.float32)
 
-    return (
-        np.asarray([s_star], dtype=np.float32),
-        np.asarray([d_obs], dtype=np.float32),
-        rep.astype(np.float32),
+    nearest_vectors = delta[nearest_indices].astype(np.float32)
+    nearest_norms = np.linalg.norm(nearest_vectors, axis=1)
+    valid_knn = nearest_norms > 1e-8
+    if np.any(valid_knn):
+        nearest_dirs = nearest_vectors[valid_knn] / nearest_norms[valid_knn].reshape(-1, 1)
+        # Smooth length scale keeps v_rep_knn from collapsing to the single closest point.
+        weight_floor = max(float(safety_robust_cap), 1e-4)
+        weights = 1.0 / (nearest_surface[valid_knn].astype(np.float32) + weight_floor)
+        weights = weights / np.maximum(float(np.sum(weights)), 1e-8)
+        rep_knn = np.sum(nearest_dirs * weights.reshape(-1, 1), axis=0)
+        rep_knn_norm = float(np.linalg.norm(rep_knn))
+        if rep_knn_norm < 1e-8:
+            rep_knn = rep.astype(np.float32)
+        else:
+            rep_knn = (rep_knn / rep_knn_norm).astype(np.float32)
+    else:
+        rep_knn = rep.astype(np.float32)
+
+    return SafetyTargets(
+        S_star_obs=np.asarray([s_star_obs], dtype=np.float32),
+        S_star_hard=np.asarray([s_star_hard], dtype=np.float32),
+        S_star_knn=np.asarray([s_star_knn], dtype=np.float32),
+        S_star_robust=np.asarray([s_star_robust], dtype=np.float32),
+        d_obs=np.asarray([d_obs_selected], dtype=np.float32),
+        d_obs_hard=np.asarray([d_obs_hard], dtype=np.float32),
+        d_obs_knn=np.asarray([d_obs_knn], dtype=np.float32),
+        d_obs_robust=np.asarray([d_obs_robust], dtype=np.float32),
+        v_rep=rep.astype(np.float32),
+        v_rep_knn=rep_knn.astype(np.float32),
+        closest_point_idx=np.asarray([closest_idx], dtype=np.int32),
     )
 
 
@@ -1705,7 +2275,13 @@ def main() -> None:
     writer.hf.attrs["n_points"] = int(args.n_points)
     writer.hf.attrs["d_max"] = float(args.d_max)
     writer.hf.attrs["d_min"] = float(args.d_min)
+    writer.hf.attrs["safety_distance_mode"] = str(args.safety_distance_mode)
+    writer.hf.attrs["S_star_obs_distance_mode"] = str(args.safety_distance_mode)
+    writer.hf.attrs["safety_knn_k"] = int(args.safety_knn_k)
+    writer.hf.attrs["safety_robust_cap"] = float(args.safety_robust_cap)
     writer.hf.attrs["ee_radius"] = float(args.ee_radius)
+    writer.hf.attrs["ee_box_half_width"] = float(args.ee_radius)
+    writer.hf.attrs["ee_safety_geometry"] = str(args.ee_safety_geometry)
     writer.hf.attrs["target_object_map_json"] = json.dumps(target_map, sort_keys=True)
     writer.hf.attrs["exclude_name_patterns_json"] = json.dumps(args.exclude_name_patterns)
     writer.hf.attrs["workspace_min"] = workspace_min
@@ -1944,12 +2520,25 @@ def main() -> None:
                         q = np.asarray(obs["robot0_joint_pos"], dtype=np.float32)
                         ee_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float32)
                         ee_quat = np.asarray(obs["robot0_eef_quat"], dtype=np.float32)
-                        s_star, d_obs, v_rep = compute_safety_targets(
+                        ee_camera_pos = camera_position_world(env, args.camera_local)
+                        ee_volume_start = (
+                            ee_camera_pos
+                            if args.ee_safety_geometry == "camera_to_eef_box"
+                            else ee_pos
+                        )
+                        ee_volume_end = ee_pos
+                        safety_targets = compute_safety_targets(
                             points_world=combined_world,
                             ee_pos_world=ee_pos,
                             d_max=float(args.d_max),
                             d_min=float(args.d_min),
                             ee_radius=float(args.ee_radius),
+                            ee_safety_geometry=str(args.ee_safety_geometry),
+                            ee_volume_start_world=ee_volume_start,
+                            ee_volume_end_world=ee_volume_end,
+                            safety_distance_mode=str(args.safety_distance_mode),
+                            safety_knn_k=int(args.safety_knn_k),
+                            safety_robust_cap=float(args.safety_robust_cap),
                         )
 
                         fused_pointcloud = np.concatenate(
@@ -1972,6 +2561,11 @@ def main() -> None:
                             "q": q,
                             "ee_pos_world": ee_pos,
                             "ee_ori_world": ee_quat,
+                            "ee_camera_pos_world": ee_camera_pos,
+                            "ee_volume_start_world": ee_volume_start.astype(np.float32),
+                            "ee_volume_end_world": ee_volume_end.astype(np.float32),
+                            "ee_volume_radius": np.asarray([float(args.ee_radius)], dtype=np.float32),
+                            "ee_volume_half_width": np.asarray([float(args.ee_radius)], dtype=np.float32),
                             "ee/pointcloud": wrist_sample.world,
                             "ee/point_object_id": wrist_sample.instance_ids,
                             "backview/pointcloud": ext_sample.world,
@@ -1979,9 +2573,17 @@ def main() -> None:
                             "fused_pointcloud/pointcloud": fused_pointcloud,
                             "fused_pointcloud/point_object_id": fused_object_ids,
                             "fused_pointcloud/source_camera": fused_source_camera,
-                            "S_star_obs": s_star,
-                            "d_obs_hard": d_obs,
-                            "v_rep": v_rep,
+                            "S_star_obs": safety_targets.S_star_obs,
+                            "S_star_hard": safety_targets.S_star_hard,
+                            "S_star_knn": safety_targets.S_star_knn,
+                            "S_star_robust": safety_targets.S_star_robust,
+                            "d_obs": safety_targets.d_obs,
+                            "d_obs_hard": safety_targets.d_obs_hard,
+                            "d_obs_knn": safety_targets.d_obs_knn,
+                            "d_obs_robust": safety_targets.d_obs_robust,
+                            "v_rep": safety_targets.v_rep,
+                            "v_rep_knn": safety_targets.v_rep_knn,
+                            "closest_point_idx": safety_targets.closest_point_idx,
                             "task_id": np.asarray([task_id], dtype=np.int32),
                             "init_state_id": np.asarray([init_id], dtype=np.int32),
                             "rollout_step": np.asarray([rollout_step], dtype=np.int32),
@@ -2000,10 +2602,28 @@ def main() -> None:
                             "init_state_id": int(init_id),
                             "rollout_step": int(rollout_step),
                             "sample_index": int(sample_index),
-                            "S_star_obs": float(s_star[0]),
-                            "d_obs_hard": float(d_obs[0]),
+                            "S_star_obs": float(safety_targets.S_star_obs[0]),
+                            "S_star_hard": float(safety_targets.S_star_hard[0]),
+                            "S_star_knn": float(safety_targets.S_star_knn[0]),
+                            "S_star_robust": float(safety_targets.S_star_robust[0]),
+                            "d_obs": float(safety_targets.d_obs[0]),
+                            "d_obs_hard": float(safety_targets.d_obs_hard[0]),
+                            "d_obs_knn": float(safety_targets.d_obs_knn[0]),
+                            "d_obs_robust": float(safety_targets.d_obs_robust[0]),
+                            "safety_distance_mode": str(args.safety_distance_mode),
+                            "safety_knn_k": int(args.safety_knn_k),
+                            "safety_robust_cap": float(args.safety_robust_cap),
+                            "v_rep": safety_targets.v_rep.tolist(),
+                            "v_rep_knn": safety_targets.v_rep_knn.tolist(),
+                            "closest_point_idx": int(safety_targets.closest_point_idx[0]),
                             "ee_pos_world": ee_pos.tolist(),
                             "ee_quat_xyzw": ee_quat.tolist(),
+                            "ee_camera_pos_world": ee_camera_pos.tolist(),
+                            "ee_volume_start_world": ee_volume_start.tolist(),
+                            "ee_volume_end_world": ee_volume_end.tolist(),
+                            "ee_volume_radius": float(args.ee_radius),
+                            "ee_volume_half_width": float(args.ee_radius),
+                            "ee_safety_geometry": str(args.ee_safety_geometry),
                             "q": q.tolist(),
                             "camera_ee": args.camera_local,
                             "camera_backview": args.camera_external,
@@ -2030,7 +2650,7 @@ def main() -> None:
                                 wrist_cloud=wrist,
                                 ext_cloud=ext,
                                 ee_pos_world=ee_pos,
-                                v_rep_world=v_rep,
+                                v_rep_world=safety_targets.v_rep,
                                 output_dir=debug_vis_dir,
                                 frame_idx=debug_frames_saved,
                                 metadata=debug_metadata,
@@ -2044,6 +2664,8 @@ def main() -> None:
                         if pose_debug_dir is not None and pose_debug_saved < pose_debug_max:
                             save_pose_sampling_debug_sample(
                                 obs=obs,
+                                env=env,
+                                camera_utils=camera_utils,
                                 ee_cloud=wrist,
                                 backview_cloud=ext,
                                 output_dir=pose_debug_dir,
@@ -2094,7 +2716,6 @@ def main() -> None:
         print(f"[dataset] debug frames saved: {debug_frames_saved} in {debug_vis_dir}")
     if pose_debug_dir is not None:
         print(f"[dataset] pose debug samples saved: {pose_debug_saved} in {pose_debug_dir}")
-
 
 
 if __name__ == "__main__":
