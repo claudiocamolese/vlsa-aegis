@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-resolution", type=int, default=24)
     parser.add_argument("--grid-margin", type=float, default=0.08)
     parser.add_argument("--min-half-extent", type=float, default=0.12)
-    parser.add_argument("--eval-batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=1024)
     parser.add_argument(
         "--n-points",
         type=int,
@@ -335,6 +335,160 @@ def choose_indices(mask: np.ndarray, max_count: int, seed: int) -> np.ndarray:
         return indices
     rng = np.random.default_rng(int(seed))
     return np.sort(rng.choice(indices, size=int(max_count), replace=False))
+
+
+def save_pointcloud_plot(
+    output_dir: Path,
+    pc_world: np.ndarray,
+    valid_mask: np.ndarray,
+    source_camera: np.ndarray,
+    robot_keypoints: np.ndarray,
+    robot_keypoint_mask: np.ndarray,
+    ee_pos: np.ndarray,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    valid = valid_mask > 0.5
+    valid_pc = pc_world[valid]
+    valid_source = source_camera[valid] if source_camera.shape[0] == pc_world.shape[0] else None
+
+    fig = plt.figure(figsize=(9, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    if valid_source is None:
+        ax.scatter(
+            valid_pc[:, 0],
+            valid_pc[:, 1],
+            valid_pc[:, 2],
+            s=3.0,
+            c="#555555",
+            alpha=0.65,
+            label="fused pointcloud",
+        )
+        legend_handles = []
+    else:
+        colors = {
+            0: "#1f77b4",
+            1: "#ff7f0e",
+        }
+        labels = {
+            0: "wrist / eye-in-hand",
+            1: "backview",
+        }
+        legend_handles = []
+        for camera_id in sorted(int(x) for x in np.unique(valid_source)):
+            camera_mask = valid_source == camera_id
+            color = colors.get(camera_id, "#555555")
+            label = labels.get(camera_id, f"camera {camera_id}")
+            points = valid_pc[camera_mask]
+            if points.shape[0] == 0:
+                continue
+            ax.scatter(
+                points[:, 0],
+                points[:, 1],
+                points[:, 2],
+                s=3.0,
+                c=color,
+                alpha=0.65,
+                label=label,
+            )
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="",
+                    color=color,
+                    label=f"{label} ({points.shape[0]})",
+                    markersize=6,
+                )
+            )
+
+    kp_valid = robot_keypoints[robot_keypoint_mask > 0.5]
+    if kp_valid.shape[0] > 0:
+        ax.plot(kp_valid[:, 0], kp_valid[:, 1], kp_valid[:, 2], c="black", linewidth=1.5)
+        ax.scatter(kp_valid[:, 0], kp_valid[:, 1], kp_valid[:, 2], s=20, c="black")
+        legend_handles.append(
+            Line2D([0], [0], marker="o", linestyle="-", color="black", label="robot keypoints")
+        )
+
+    ax.scatter(
+        [ee_pos[0]],
+        [ee_pos[1]],
+        [ee_pos[2]],
+        s=55,
+        c="#f2d22e",
+        edgecolors="black",
+        label="EE",
+    )
+    legend_handles.append(
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            color="#f2d22e",
+            markeredgecolor="black",
+            label="EE",
+            markersize=7,
+        )
+    )
+
+    ax.set_title("Fused obstacle pointcloud in world coordinates")
+    ax.set_xlabel("x_world")
+    ax.set_ylabel("y_world")
+    ax.set_zlabel("z_world")
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="upper right")
+
+    bounds_parts = [valid_pc]
+    if kp_valid.shape[0] > 0:
+        bounds_parts.append(kp_valid)
+    bounds_parts.append(np.asarray(ee_pos, dtype=np.float32).reshape(1, 3))
+    set_axes_equal_3d(ax, np.concatenate(bounds_parts, axis=0))
+    fig.tight_layout()
+    fig.savefig(output_dir / "pointcloud.png", dpi=180)
+    plt.close(fig)
+
+
+def save_pointcloud_ply(
+    output_dir: Path,
+    pc_world: np.ndarray,
+    valid_mask: np.ndarray,
+    source_camera: np.ndarray,
+) -> None:
+    points = np.asarray(pc_world, dtype=np.float32).reshape(-1, 3)
+    valid = np.asarray(valid_mask).reshape(-1) > 0.5
+    source = np.asarray(source_camera).reshape(-1)
+    if source.shape[0] != points.shape[0]:
+        source = np.full((points.shape[0],), -1, dtype=np.int32)
+
+    points = points[valid]
+    source = source[valid]
+
+    color_by_source = {
+        0: (31, 119, 180),
+        1: (255, 127, 14),
+    }
+    output_path = output_dir / "pointcloud_from_h5.ply"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {points.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for point, camera_id in zip(points, source):
+            r, g, b = color_by_source.get(int(camera_id), (120, 120, 120))
+            f.write(
+                f"{float(point[0]):.7f} {float(point[1]):.7f} {float(point[2]):.7f} "
+                f"{int(r)} {int(g)} {int(b)}\n"
+            )
 
 
 def save_unsafe_plot(
@@ -657,9 +811,26 @@ def main() -> None:
 
     pc_world = sample["pc_world"].numpy()
     valid_mask = sample["valid_mask"].numpy()
+    source_camera = sample["source_camera"].numpy()
     ee_pos = sample["ee_pos_world"].numpy()
     robot_keypoints = sample["robot_keypoints_world"].numpy()
     robot_keypoint_mask = sample["robot_keypoint_valid_mask"].numpy()
+
+    save_pointcloud_plot(
+        output_dir=output_dir,
+        pc_world=pc_world,
+        valid_mask=valid_mask,
+        source_camera=source_camera,
+        robot_keypoints=robot_keypoints,
+        robot_keypoint_mask=robot_keypoint_mask,
+        ee_pos=ee_pos,
+    )
+    save_pointcloud_ply(
+        output_dir=output_dir,
+        pc_world=pc_world,
+        valid_mask=valid_mask,
+        source_camera=source_camera,
+    )
 
     grid_points, axes, grid_min, grid_max = make_grid(
         pc_world=pc_world,
@@ -744,6 +915,8 @@ def main() -> None:
         "phi_max": float(np.max(phi)),
         "phi_mean": float(np.mean(phi)),
         "unsafe_count": int(np.sum(phi <= threshold)),
+        "pointcloud_image": str(output_dir / "pointcloud.png"),
+        "pointcloud_ply": str(output_dir / "pointcloud_from_h5.ply"),
         "sample": sample_meta,
     }
     with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:

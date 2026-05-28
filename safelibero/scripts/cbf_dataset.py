@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
+
 
 LIBERO_DUMMY_ACTION_VALUES = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]
 

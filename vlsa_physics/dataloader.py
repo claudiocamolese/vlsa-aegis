@@ -141,6 +141,27 @@ def _split_sample_index(
     return train, val
 
 
+def mirror_pointcloud_z(points: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """Mirror valid pointcloud points along z.
+
+    This is a compatibility fix for H5 files generated with the camera-cloud
+    vertical convention flipped. It only changes the observed obstacle
+    pointcloud input; scalar labels stored in the H5 are left untouched.
+    """
+
+    pc = np.asarray(points, dtype=np.float32).reshape(-1, 3).copy()
+    valid = np.asarray(valid_mask).reshape(-1).astype(bool)
+    valid &= np.isfinite(pc).all(axis=1)
+    if not np.any(valid):
+        return pc
+
+    z = pc[valid, 2]
+    z_min = float(np.min(z))
+    z_max = float(np.max(z))
+    pc[valid, 2] = (z_min + z_max) - pc[valid, 2]
+    return pc
+
+
 class CBFSafetyDataset(Dataset):
     def __init__(
         self,
@@ -148,6 +169,7 @@ class CBFSafetyDataset(Dataset):
         index: Sequence[Tuple[str, int]],
         n_points: Optional[int] = None,
         random_point_subsample: bool = False,
+        mirror_pointcloud_z_axis: bool = True,
         seed: int = 0,
     ) -> None:
         self.h5_path = str(h5_path)
@@ -156,6 +178,7 @@ class CBFSafetyDataset(Dataset):
         self.scene_to_id = {scene_path: scene_id for scene_id, scene_path in enumerate(scene_paths)}
         self.n_points = None if n_points is None else int(n_points)
         self.random_point_subsample = bool(random_point_subsample)
+        self.mirror_pointcloud_z_axis = bool(mirror_pointcloud_z_axis)
         self.seed = int(seed)
         self._hf = None
 
@@ -268,6 +291,9 @@ class CBFSafetyDataset(Dataset):
         else:
             source_camera = source_camera.astype(np.int8).reshape(-1)
 
+        if self.mirror_pointcloud_z_axis:
+            pc = mirror_pointcloud_z(pc, valid_mask)
+
         point_seed = self._stable_int_seed(scene_path, sample_idx)
         point_indices = self._point_indices_stratified(
             valid_mask=valid_mask,
@@ -309,6 +335,10 @@ class CBFSafetyDataset(Dataset):
             "dataset_index": torch.tensor(idx, dtype=torch.long),
             "sample_index": torch.tensor(sample_idx, dtype=torch.long),
             "scene_index": torch.tensor(self.scene_to_id[scene_path], dtype=torch.long),
+            "pointcloud_z_mirrored": torch.tensor(
+                [int(self.mirror_pointcloud_z_axis)],
+                dtype=torch.long,
+            ),
         }
         if "v_rep_knn" in out:
             sample["v_rep_knn"] = torch.from_numpy(out["v_rep_knn"].astype(np.float32).reshape(3))
@@ -360,6 +390,7 @@ def make_datasets(
     seed: int = 42,
     n_points: Optional[int] = None,
     random_point_subsample: bool = False,
+    mirror_pointcloud_z_axis: bool = True,
 ) -> Tuple[CBFSafetyDataset, CBFSafetyDataset]:
     scenes = list_scenes(h5_path)
     if split_mode == "scene":
@@ -377,6 +408,7 @@ def make_datasets(
             index=train_index,
             n_points=n_points,
             random_point_subsample=random_point_subsample,
+            mirror_pointcloud_z_axis=mirror_pointcloud_z_axis,
             seed=seed,
         ),
         CBFSafetyDataset(
@@ -384,6 +416,7 @@ def make_datasets(
             index=val_index,
             n_points=n_points,
             random_point_subsample=False,
+            mirror_pointcloud_z_axis=mirror_pointcloud_z_axis,
             seed=seed + 1,
         ),
     )
@@ -398,6 +431,7 @@ def get_dataloader(
     seed: int = 42,
     n_points: Optional[int] = None,
     random_point_subsample: bool = False,
+    mirror_pointcloud_z_axis: bool = True,
     pin_memory: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     train_dataset, val_dataset = make_datasets(
@@ -407,6 +441,7 @@ def get_dataloader(
         seed=seed,
         n_points=n_points,
         random_point_subsample=random_point_subsample,
+        mirror_pointcloud_z_axis=mirror_pointcloud_z_axis,
     )
     generator = torch.Generator()
     generator.manual_seed(int(seed))

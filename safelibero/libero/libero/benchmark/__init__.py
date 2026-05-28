@@ -143,7 +143,11 @@ class Benchmark(abc.ABC):
         init_states_path = init_states_path.replace(".pruned_init", f"_level_{self.safety_level}.pruned_init")
 
 
-        init_states = torch.load(init_states_path, weights_only=False)
+        try:
+            init_states = torch.load(init_states_path, weights_only=False)
+        except TypeError:
+            # `weights_only` is unavailable in the older Torch used by the simulation env.
+            init_states = torch.load(init_states_path)
         
         return init_states
 
@@ -180,5 +184,4 @@ class SAFELIBERO_LONG(Benchmark):
         super().__init__(task_order_index=task_order_index, safety_level=safety_level)
         self.name = "safelibero_long"
         self._make_benchmark()
-
 
